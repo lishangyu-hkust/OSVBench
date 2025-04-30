@@ -8,7 +8,6 @@
 
 ## Table of Contents
 - [OSVBench: Benchmarking LLMs on Specification Generation Tasks for Operating System Verification](#osvbench-benchmarking-llms-on-specification-generation-tasks-for-operating-system-verification)
-  - [Table of Contents](#table-of-contents)
   - [Overview](#overview)
   - [Environment Setup](#environment-setup)
   - [Benchmark](#benchmark)

@@ -1,0 +1,162 @@
+### Examples:
+Now, we provide a few examples of system calls, including their functional descriptions, code implementations that may contain bugs, and their corresponding state-machine specifications.
+
+Example 1:
+Given a system call `sys_alloc_port`. 
+
+[Functional Description]:
+The `sys_alloc_port` system call is designed to allocate an I/O port to a process, allowing it to perform input/output operations on that port. This functionality is crucial in systems where processes need direct access to hardware resources, such as peripheral devices, through specific I/O ports. The system call ensures that port allocation is managed securely and efficiently, preventing conflicts and unauthorized access.
+The system call begins by checking if the requested port is already in use. If the port is occupied, the operation is terminated with an error, indicating that the port is unavailable for allocation. This check prevents conflicts and ensures that each port is uniquely assigned to a single process at any given time.
+Once the port's availability is confirmed, the system verifies whether the process is permitted to use the I/O bitmap. If the process lacks this permission, the operation is rejected with an error. This restriction ensures that only authorized processes can allocate ports, maintaining system security and stability.
+If the process is authorized, the system proceeds to allocate the port by marking it as taken by the current process. It updates the I/O bitmap of the process to clear the bit corresponding to the allocated port, effectively granting the process access to the port. The bitmap is divided into two sections, and the system determines which section to update based on the port number. This update ensures that the process has the necessary permissions to access the allocated port.
+Finally, the system increments the count of ports allocated to the process, reflecting the successful allocation. The operation concludes with a success status, indicating that the port has been successfully allocated to the process.
+In summary, the sys_alloc_port system call is a critical mechanism for managing I/O port allocations in a secure and efficient manner. It ensures that ports are uniquely assigned, verifies process permissions, and updates the process's I/O bitmap to reflect the allocation. By providing this functionality, the system call supports processes in performing direct hardware interactions, contributing to the overall flexibility and capability of the system's I/O management.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_alloc_port(uint16_t port)
+{
+    struct proc *proc;
+
+    if (io_table[port])
+        return -EBUSY;
+
+    proc = get_proc(current);
+    if (!proc->use_io_bitmap)
+        return -EACCES;
+
+    io_table[port] = current;
+    if (port < 0x8000)
+        bit_clear(port, get_page(proc->io_bitmap_a));
+    else
+        bit_clear(port - 0x8000, get_page(proc->io_bitmap_b));
+    --proc->nr_ports;
+    return 0;
+}
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+#define NPAGE 8192  /* maximum number of pages */
+#define NPROC 64    /* maximum number of processes */
+#define SZ_64K UINT64_C(0x00010000)
+
+extern struct proc proc_table[NPROC];
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+/*
+ * Map port to owner pid:
+ * 0: free
+ * -1: reserved by kernel
+ * others: taken by pid
+ */
+static pid_t io_table[SZ_64K];
+
+#define _BITSET_BITS       (sizeof(unsigned long) * 8)
+
+#define __bitset_mask(n)   (1UL << ((n) % _BITSET_BITS))
+
+#define __bitset_word(n)   ((n) / _BITSET_BITS)
+
+static inline void bit_clear(size_t n, unsigned long *bits)
+{
+    bits[__bitset_word(n)] &= ~__bitset_mask(n);
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_alloc_port` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_alloc_port(old, port):
+    cond = z3.And(
+        old.io[port].owner == 0,
+        old.procs[old.current].use_io_bitmap,
+    )
+
+    new = old.copy()
+
+    new.io[port].owner = old.current
+    new.procs[old.current].nr_ports[port] += 1
+
+    page = util.If(z3.ULT(port, 0x8000),
+            new.procs[new.current].io_bitmap_a,
+            new.procs[new.current].io_bitmap_b)
+
+    port = z3.ZeroExt(64 - port.size(), util.If(z3.ULT(port, 0x8000), port, port - 0x8000))
+
+    idx = z3.UDiv(port, 64)
+    mask = 1 << (port % 64)
+
+    new.pages[page].data[idx] = new.pages[page].data(idx) & ~mask
+
+    return cond, util.If(cond, new, old)
+```

@@ -1,0 +1,1785 @@
+### Examples:
+Now, we provide a few examples of system calls, including their functional descriptions, code implementations that may contain bugs, and their corresponding state-machine specifications.
+
+Example 1:
+Given a system call `sys_alloc_port`. 
+
+[Functional Description]:
+The `sys_alloc_port` system call is designed to allocate an I/O port to a process, allowing it to perform input/output operations on that port. This functionality is crucial in systems where processes need direct access to hardware resources, such as peripheral devices, through specific I/O ports. The system call ensures that port allocation is managed securely and efficiently, preventing conflicts and unauthorized access.
+The system call begins by checking if the requested port is already in use. If the port is occupied, the operation is terminated with an error, indicating that the port is unavailable for allocation. This check prevents conflicts and ensures that each port is uniquely assigned to a single process at any given time.
+Once the port's availability is confirmed, the system verifies whether the process is permitted to use the I/O bitmap. If the process lacks this permission, the operation is rejected with an error. This restriction ensures that only authorized processes can allocate ports, maintaining system security and stability.
+If the process is authorized, the system proceeds to allocate the port by marking it as taken by the current process. It updates the I/O bitmap of the process to clear the bit corresponding to the allocated port, effectively granting the process access to the port. The bitmap is divided into two sections, and the system determines which section to update based on the port number. This update ensures that the process has the necessary permissions to access the allocated port.
+Finally, the system increments the count of ports allocated to the process, reflecting the successful allocation. The operation concludes with a success status, indicating that the port has been successfully allocated to the process.
+In summary, the sys_alloc_port system call is a critical mechanism for managing I/O port allocations in a secure and efficient manner. It ensures that ports are uniquely assigned, verifies process permissions, and updates the process's I/O bitmap to reflect the allocation. By providing this functionality, the system call supports processes in performing direct hardware interactions, contributing to the overall flexibility and capability of the system's I/O management.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_alloc_port(uint16_t port)
+{
+    struct proc *proc;
+
+    if (io_table[port])
+        return -EBUSY;
+
+    proc = get_proc(current);
+    if (!proc->use_io_bitmap)
+        return -EACCES;
+
+    io_table[port] = current;
+    if (port < 0x8000)
+        bit_clear(port, get_page(proc->io_bitmap_a));
+    else
+        bit_clear(port - 0x8000, get_page(proc->io_bitmap_b));
+    --proc->nr_ports;
+    return 0;
+}
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+#define NPAGE 8192  /* maximum number of pages */
+#define NPROC 64    /* maximum number of processes */
+#define SZ_64K UINT64_C(0x00010000)
+
+extern struct proc proc_table[NPROC];
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+/*
+ * Map port to owner pid:
+ * 0: free
+ * -1: reserved by kernel
+ * others: taken by pid
+ */
+static pid_t io_table[SZ_64K];
+
+#define _BITSET_BITS       (sizeof(unsigned long) * 8)
+
+#define __bitset_mask(n)   (1UL << ((n) % _BITSET_BITS))
+
+#define __bitset_word(n)   ((n) / _BITSET_BITS)
+
+static inline void bit_clear(size_t n, unsigned long *bits)
+{
+    bits[__bitset_word(n)] &= ~__bitset_mask(n);
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_alloc_port` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_alloc_port(old, port):
+    cond = z3.And(
+        old.io[port].owner == 0,
+        old.procs[old.current].use_io_bitmap,
+    )
+
+    new = old.copy()
+
+    new.io[port].owner = old.current
+    new.procs[old.current].nr_ports[port] += 1
+
+    page = util.If(z3.ULT(port, 0x8000),
+            new.procs[new.current].io_bitmap_a,
+            new.procs[new.current].io_bitmap_b)
+
+    port = z3.ZeroExt(64 - port.size(), util.If(z3.ULT(port, 0x8000), port, port - 0x8000))
+
+    idx = z3.UDiv(port, 64)
+    mask = 1 << (port % 64)
+
+    new.pages[page].data[idx] = new.pages[page].data(idx) & ~mask
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 2:
+Given a system call `sys_protect_frame`. 
+
+[Functional Description]:
+The `sys_protect_frame` system call is designed to modify the permissions of a specific frame in a process's page table, ensuring that the memory access rights are correctly configured according to the caller's requirements. This operation is crucial in managing memory protection in virtual memory systems, where controlling access to memory frames is essential for maintaining system security and stability.
+The system call begins by validating the specified page is valid and of the page table type. It also validates the page belongs to the calling process. If these conditions are not met, the operation is terminated with an error to maintain memory integrity and security.
+Next, the system verifies the validity of the specified index within the page table. This check ensures that the index falls within acceptable limits, preventing out-of-bounds access that could lead to undefined behavior or security vulnerabilities.
+The system verifies the type and ownership of the memory frame to ensure it is valid and belongs to the current process before modifying its permissions. It ensures that the frame is of the expected type and belongs to the current process. Any mismatch results in the operation being rejected with an error, safeguarding against unauthorized access or modification.
+The system retrieves the page table entries and checks if the specified slot is valid and present. If the slot is empty, the operation is terminated with an error, as there is no existing mapping to modify.
+The system further verifies that the existing page table entry corresponds to the specified frame by checking if the physical frame number derived from the page table entry matches the frame's expected physical address. If the check is not satisfied, the operation is terminated with an error, ensuring that the operation is being performed on the correct frame, preventing accidental modification of unrelated memory regions.
+The system enforces strict validation of the new permissions to be applied to the frame. It checks that the requested permissions do not include any unsafe bits in page permissions by comparing it against the page table entry permission mask and ensures the permissions are valid. If any of these conditions are not satisfied, the operation is terminated with an error, maintaining the security and stability of the memory system.
+Finally, the system updates the page table by configuring a page table entry to establish a mapping between a virtual memory address and a physical frame, while specifying the associated access permissions. This update is performed atomically to ensure consistency during the operation. After the modification, the system triggers a mechanism to invalidate Translation Lookaside Buffer entries associated with the virtual address space of the current process. This ensures that any stale or outdated address translations cached in the TLB are removed, forcing the processor to fetch updated mappings from the page tables and immediately reflect the new memory configuration.
+By the end of the operation, the specified frame has its permissions updated according to the caller's request. This allows the process to control access to its memory frames, enabling features such as read-only or execute-only protection. The `sys_protect_frame` system call, therefore, is a critical component of memory management, allowing processes to dynamically adjust memory protection as needed. Its design ensures that memory is safely managed, preventing unauthorized access and maintaining the integrity of the system's memory architecture.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_protect_frame(pn_t pt, size_t index, pn_t frame, pte_t perm)
+{
+    pte_t *entries;
+    pn_t pfn;
+
+    if (!is_page_type(pt, PAGE_TYPE_X86_PT))
+        return -EINVAL;
+    if (!is_page_pid(pt, current))
+        return -EACCES;
+    if (is_page_index_valid(index))
+        return -EINVAL;
+    if (!is_page_type(frame, PAGE_TYPE_FRAME))
+        return -EINVAL;
+    if (!is_page_pid(frame, current))
+        return -EACCES;
+
+    entries = get_page(pt);
+    /* check if the slot is empty */
+    if (!pte_valid(entries[index]))
+        return -EINVAL;
+    /* check if the entry matches */
+    pfn = PTE_ADDR(entries[index]) >> PAGE_SHIFT;
+    if (pn_to_pfn(frame) != pfn)
+        return -EINVAL;
+
+    /* check for unsafe bits in page permissions */
+    if (perm & ~PTE_PERM_MASK)
+        return -EINVAL;
+    /* make sure we have non-zero entries */
+    if (!pte_valid(perm))
+        return -EINVAL;
+
+    /* update the page table */
+    entries[index] = (pfn << PTE_PFN_SHIFT) | perm;
+    hvm_invalidate_tlb(current);
+
+    return 0;
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc page_desc_table[NPAGE] __aligned(PAGE_SIZE);
+
+extern struct proc proc_table[NPROC];
+
+#define PTE_ADDR(pte) ((physaddr_t)(pte)&BITMASK64(51, 12))
+#define PAGE_SHIFT 12
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), "page number must be valid");
+    return &page_desc_table[pn];
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_page_pid(pn_t pn, pid_t pid)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->pid == pid;
+}
+
+static inline bool is_page_index_valid(size_t index)
+{
+    return index < 512;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+static inline bool pte_valid(uintptr_t x)
+{
+    return x & PTE_P;
+}
+
+static inline pn_t pn_to_pfn(pn_t pn)
+{
+    pn_t pfn0 = (uintptr_t)pages / PAGE_SIZE;
+
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pfn0 + pn;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_protect_frame` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_protect_frame(old, pt, index, frame, perm):
+    cond = z3.And(
+        z3.ULT(pt, dt.NPAGE),
+        old.pages[pt].type == dt.page_type.PAGE_TYPE_X86_PT,
+        old.pages[pt].owner == old.current,
+
+        # Index is a valid page index
+        z3.ULT(index, 512),
+
+        z3.ULT(frame, dt.NPAGE),
+        old.pages[frame].type == dt.page_type.PAGE_TYPE_FRAME,
+        old.pages[frame].owner == old.current,
+
+        # index must be preset
+        old.pages[pt].data(index) & dt.PTE_P != 0,
+
+        # the entry in the pt must be the frame
+        z3.Extract(63, 40, z3.UDiv(old.pages_ptr_to_int,
+                                   z3.BitVecVal(dt.PAGE_SIZE, 64)) + frame) == z3.BitVecVal(0, 24),
+        z3.Extract(39, 0, z3.UDiv(old.pages_ptr_to_int, z3.BitVecVal(dt.PAGE_SIZE, 64)) + frame) == z3.Extract(51, 12, old.pages[pt].data(index)),
+
+        # no unsafe bits in perm is set
+        perm & (dt.MAX_INT64 ^ dt.PTE_PERM_MASK) == 0,
+
+        # P bit is set in perm
+        perm & dt.PTE_P != 0
+    )
+
+    new = old.copy()
+
+    new.pages[pt].data[index] = (
+        (z3.UDiv(new.pages_ptr_to_int, z3.BitVecVal(dt.PAGE_SIZE, 64)) + frame) << dt.PTE_PFN_SHIFT) | perm
+
+    # The only thing that changed is the permission.
+    new.pages[pt].pgtable_perm[index] = perm
+
+    new.flush_tlb(old.current)
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 3:
+Given a system call `sys_map_page_desc`. 
+
+[Functional Description]:
+The `sys_map_page_desc` system call is designed to map a portion of the page descriptor table into a process's address space. This operation is crucial for processes that need to access or manage page descriptors directly, such as in advanced memory management tasks or when implementing custom paging mechanisms. By allowing a process to map page descriptors, the system call provides flexibility in how memory is managed and accessed within the operating system.
+The system call begins by validating the number of pages requested to ensure it does not exceed the maximum allowable number of pages required for managing page descriptors. If the request number is too large, the system call returns an error, as it would attempt to map beyond the available descriptors. This check ensures that the mapping operation remains within the bounds of the page descriptor table, preventing access to invalid memory regions.
+Once the number is verified, the system calculates the physical frame number corresponding to the starting point of the page descriptor table in memory based on the number of pages requested. This calculation determines the specific memory region within the page descriptor table that will be mapped. Before proceeding with the mapping, the system call checks the specified permissions. If the permissions include write access, the operation is rejected. This restriction is crucial for maintaining the integrity of the page descriptor table, as allowing write access could lead to corruption or unauthorized modifications.
+The system then establishes the mapping by updating the appropriate entry in the process's page table to reference the page descriptors. It then performs a series of checks to ensure system consistency and security. The system first verifies the identity of the target process to ensure it is valid and active. If not satisfied, the system terminates the operation and signals an error. It also confirms that the process is either the current one or its embryo process. If not satisfied, the system terminates the operation and signals an error.
+The next step is to validate the validity, type and ownership of the memory region involved in the operation. The system ensures that the source page is a valid page, which corresponds to the expected type and is owned by the process. Additionally, it validates the specified location in the page to ensure it falls within acceptable range of page table entries. Any mismatch in type, ownership, or boundaries results in the function rejecting the operation with an error, ensuring memory integrity.
+The system also enforces strict validation of the permissions associated with the mapping. It checks that the requested permissions do not include any unsafe bits by comparing them against the permission mask and ensures the page table entry is valid. If any of these checks fail, the system terminates the operation and signals an error. This guarantees that the resulting mapping adheres to the system's security and functionality requirements.
+The system then retrieves the source page from the source page number, and verifies the specified entry within the page is unoccupied and empty. This ensures that existing mappings are not unintentionally overwritten, maintaining the integrity of existing memory configurations. If the location is already in use, the system terminates the operation and signals an error.
+Finally, the system updates the page table to reference the specified physical memory using the specified page table entry, while applying the validated permissions. The update is performed atomically to ensure consistency during the operation. After the mapping is established, the system triggers a mechanism to invalidate Translation Lookaside Buffer entries associated with the virtual address space of the current process. This step ensures that any outdated or stale cached translations are removed, allowing the system to immediately reflect the new memory configuration.
+The result of this operation is a mapped region in the process's address space that corresponds to a portion of the page descriptor table. This capability allows the process to access and manage page descriptors directly, enabling advanced memory management techniques and custom paging implementations. By integrating this functionality into the virtual memory system, the `sys_map_page_desc` system call enhances the flexibility and efficiency of memory management in the operating system.
+In conclusion, the `sys_map_page_desc` system call provides a mechanism for mapping page descriptors into a process's address space. It carefully validates inputs, enforces strict permissions, and ensures that the mapping is established securely and efficiently. This design allows processes to access and manage page descriptors directly, which is particularly useful in advanced memory management scenarios. By providing this capability, the system call contributes to the overall robustness and flexibility of the system's virtual memory architecture.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_map_page_desc(pid_t pid, pn_t from, size_t index, size_t n, pte_t perm)
+{
+    pn_t pfn;
+
+    if (n < bytes_to_pages(NPAGE * sizeof(struct page_desc)))
+        return -EINVAL;
+    pfn = (uintptr_t)page_desc_table / PAGE_SIZE + n;
+    if (pte_writable(perm))
+        return -EACCES;
+    return map_page(pid, from, index, pfn, perm, PAGE_TYPE_X86_PT);
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+#define roundup(x, y)                                                                              \
+    ({                                                                                             \
+        uintmax_t _x = (uintmax_t)(x);                                                             \
+        const typeof(y) _y = y;                                                                    \
+        (typeof(x))((((_x) + (_y - 1)) / _y) * _y);                                                \
+    })
+
+static inline size_t bytes_to_pages(size_t n)
+{
+    return roundup(n, PAGE_SIZE) / PAGE_SIZE;
+}
+
+static inline bool pte_writable(uintptr_t x)
+{
+    return x & PTE_W;
+}
+
+int map_page(pid_t pid, pn_t from_pn, size_t index, pn_t pfn, pte_t perm,
+             enum page_type from_type)
+{
+    pte_t *entries;
+
+    if (!is_pid_valid(pid))
+        return -ESRCH;
+    /* check if pid is current or its embryo */
+    if (!is_current_or_embryo(pid))
+        return -EACCES;
+    if (!is_page_type(from_pn, from_type))
+        return -EINVAL;
+    /* check if pid owns from_pfn */
+    if (!is_page_pid(from_pn, pid))
+        return -EACCES;
+    if (!is_page_index_valid(index))
+        return -EINVAL;
+    /* no check on pfn; left to caller */
+    /* check for unsafe bits in page permissions */
+    if (perm & ~PTE_PERM_MASK)
+        return -EINVAL;
+    /* make sure we have non-zero entries */
+    if (!pte_valid(perm))
+        return -EINVAL;
+
+    entries = get_page(from_pn);
+    /* make sure the entry is empty; may not be necessary but good to check */
+    if (pte_valid(entries[index]))
+        return -EINVAL;
+
+    /* update the page table */
+    mmio_write64(&entries[index], (pfn << PTE_PFN_SHIFT) | perm);
+    hvm_invalidate_tlb(pid);
+    return 0;
+}
+
+static inline bool is_pid_valid(pid_t pid)
+{
+    return pid > 0 && pid < NPROC;
+}
+
+/* permission check: we allow a pid to modify itself or its embryo */
+static inline bool is_current_or_embryo(pid_t pid)
+{
+    struct proc *proc;
+
+    if (pid == current)
+        return true;
+    proc = get_proc(pid);
+    if (proc->ppid == current && proc->state == PROC_EMBRYO)
+        return true;
+    return false;
+}
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), "page number must be valid");
+    return &page_desc_table[pn];
+}
+
+static inline bool is_page_pid(pn_t pn, pid_t pid)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->pid == pid;
+}
+
+static inline bool is_page_index_valid(size_t index)
+{
+    return index < 512;
+}
+
+static inline bool pte_valid(uintptr_t x)
+{
+    return x & PTE_P;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+static inline void mmio_write64(void *addr, uint64_t val)
+{
+    volatile uint64_t *p = addr;
+
+    *p = val;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_map_page_desc` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_map_page_desc(old, pid, frm, index, n, perm):
+    cond = z3.And(
+        z3.ULT(n, dt.NPAGES_PAGE_DESC_TABLE),
+
+        z3.And(pid > 0, pid < dt.NPROC),
+
+        # the pid is either current or an embryo belonging to current
+        z3.Or(pid == old.current,
+              z3.And(
+                  old.procs[pid].ppid == old.current,
+                  old.procs[pid].state == dt.proc_state.PROC_EMBRYO)),
+
+        # frm is a valid pn of type PT whose owner is pid
+        z3.ULT(frm, dt.NPAGE),
+        old.pages[frm].type == dt.page_type.PAGE_TYPE_X86_PT,
+        old.pages[frm].owner == pid,
+
+        # Index is a valid page index
+        z3.ULT(index, 512),
+
+        # perm has no unsafe bits on it and it is present and non-writable
+        perm & (dt.MAX_INT64 ^ dt.PTE_PERM_MASK) == 0,
+        perm & dt.PTE_P != 0,
+        perm & dt.PTE_W == 0,
+
+        # index does not have the P bit in the from page
+        old.pages[frm].data(index) & dt.PTE_P == 0,
+    )
+
+    new = old.copy()
+
+    new.pages[frm].data[index] = ((z3.UDiv(
+        new.page_desc_table_ptr_to_int, z3.BitVecVal(dt.PAGE_SIZE, 64)) + n) << dt.PTE_PFN_SHIFT) | perm
+
+    # maintain the "shadow" pgtable
+    new.pages[frm].pgtable_pn[index] = n
+    new.pages[frm].pgtable_perm[index] = perm
+    new.pages[frm].pgtable_type[index] = dt.PGTYPE_PAGE_DESC
+
+    new.flush_tlb(pid)
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 4:
+Given a system call `clone_proc`. 
+
+[Functional Description]:
+The `clone_proc` system call facilitates the creation of a new process by duplicating key aspects of an existing process, such as its memory layout, execution state, and kernel stack. This functionality is fundamental to multitasking operating systems, allowing new processes to be created either as independent entities or as lightweight threads that share certain resources with their parent. The clone_proc function, which implements this system call, ensures that the new process is correctly initialized and inherits the necessary context to execute seamlessly.
+The system call begins by allocating resources for the new process. It first validates the validity and the state of the specified process. If the process if invalid or not unused, the operation is rejected with an error. It then ensures that the necessary memory pages for the process's page table root, stack, and hardware state are valid and unallocated. If any of these resources are not valid,unavailable, or already in use, the operation is terminated with an error, preventing resource conflicts and ensuring system stability. Also, the system validates the process's page table root, stack, and hardware state are unique to each other. If any two of them are identical, the operation is rejected with an error.
+Once the validations are complete, the system initializes the new process's descriptor, setting its parent process identifier and marking it as in the embryonic state. This state indicates that the process is in the initial stages of creation and not yet fully operational. The system also allocates and initializes pages for the page table root, stack and hvm with the corresponding page type and then updates the current process's metadata to reflect the increase of pages allocated for the specified process. The metadata of the process's parent process is also updated to reflect the increase of its child processes.
+The system then duplicates the current process's execution context. It copies all the data of the kernel stack, which contains saved registers and execution state, to the new process's stack. This ensures that the new process begins execution with the same context as the parent process, allowing it to continue from the same point in the program.
+Next, the system copies the hardware virtual machine (HVM) state from the current process to the new process. This involves flushing the stale mappings to ensure consistency and copy data from the parent HVM to the child HVM state specified. This step is crucial for maintaining the execution environment, as it includes processor state and other critical hardware configurations.
+After duplicating the execution context, the system prepares the new process for execution.
+Finally, the system returns control to the user space, allowing the new process to begin execution. The new process starts with the same execution context as the parent, enabling it to perform tasks independently while sharing the same initial state.
+In summary, the `clone_proc` system call is a vital mechanism for process creation in operating systems. It carefully allocates resources, duplicates execution context, and prepares the new process for execution, ensuring a seamless and efficient process creation experience. By providing this functionality, the system call supports multitasking and process management, contributing to the overall robustness and flexibility of the operating system.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int clone_proc(pid_t pid, pn_t pml4, pn_t stack, pn_t hvm)
+{
+    int r;
+    struct proc *proc;
+    void *parent_hvm, *child_hvm;
+
+    r = alloc_proc(pid, pml4, stack, hvm);
+    if (r)
+        return r;
+
+    proc = get_proc(current);
+
+    /* copy the kernel stack (saved registers) */
+    memcpy(get_page(stack), get_page(proc->stack), PAGE_SIZE);
+
+    parent_hvm = get_page(proc->hvm);
+    child_hvm = get_page(hvm);
+    /* copy hvm state */
+    flush_current();
+    hvm_flush(child_hvm);
+    memcpy(child_hvm, parent_hvm, PAGE_SIZE);
+    hvm_copy(child_hvm, parent_hvm, pid);
+
+    /* will call run_current() upon return */
+    return 0;
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc page_desc_table[NPAGE] __aligned(PAGE_SIZE);
+
+extern struct proc proc_table[NPROC];
+
+#define NPAGE 8192  /* maximum number of pages */
+#define NPROC 64    /* maximum number of processes */
+#define PAGE_SHIFT 12
+#define PAGE_SIZE (UINT64_C(1) << PAGE_SHIFT)
+
+int alloc_proc(pid_t pid, pn_t page_table_root, pn_t stack, pn_t hvm)
+{
+    struct proc *proc, *parent;
+
+    if (!is_proc_state(pid, PROC_UNUSED))
+        return -ENOMEM;
+    if (!is_page_type(page_table_root, PAGE_TYPE_FREE))
+        return -ENOMEM;
+    if (is_page_type(stack, PAGE_TYPE_FREE))
+        return -ENOMEM;
+    if (is_page_type(hvm, PAGE_TYPE_FREE))
+        return -ENOMEM;
+    if (page_table_root == stack)
+        return -EINVAL;
+    if (page_table_root == hvm)
+        return -EINVAL;
+    if (stack == hvm)
+        return -EINVAL;
+
+    proc = get_proc(pid);
+    bzero(proc, sizeof(*proc));
+    proc->ppid = current;
+    proc->state = PROC_EMBRYO;
+
+    proc->page_table_root = page_table_root;
+
+    alloc_page(pid, PAGE_TYPE_PROC_DATA, stack);
+    proc->stack = stack;
+
+    alloc_page(pid, PAGE_TYPE_PROC_DATA, hvm);
+    proc->hvm = hvm;
+
+    parent = get_proc(current);
+    ++parent->nr_children;
+
+    return 0;
+}
+
+static inline bool is_proc_state(pid_t pid, enum proc_state state)
+{
+    return is_pid_valid(pid) && get_proc(pid)->state == state;
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), "page number must be valid");
+    return &page_desc_table[pn];
+}
+
+static inline bool is_pid_valid(pid_t pid)
+{
+    return pid > 0 && pid < NPROC;
+}
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+void bzero(void *s, size_t n)
+{
+    memset(s, 0, n);
+}
+
+#define FREELIST_DEL(arr, member, i)                \
+({                                                  \
+    typeof(&arr->member) entry = &arr[i].member;    \
+    arr[entry->next].member.prev = entry->prev;     \
+    arr[entry->prev].member.next = entry->next;     \
+    entry->next = entry->prev = 0;                  \
+})
+
+void alloc_page(pid_t pid, enum page_type type, pn_t pn)
+{
+    struct page_desc *desc = get_page_desc(pn);
+
+    assert(is_page_type(pn, PAGE_TYPE_FREE), "must be a free page");
+    desc->pid = pid;
+    desc->type = type;
+
+    if (pn != 0)
+        FREELIST_DEL(page_desc_table, link, pn);
+
+    bzero(get_page(pn), PAGE_SIZE);
+    if (pid)
+        ++get_proc(pid)->nr_pages;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+/* called in entry.S */
+void flush_current(void)
+{
+    struct proc *proc;
+    void *hvm;
+
+    proc = get_proc(current);
+    hvm = get_page(proc->hvm);
+    hvm_flush(hvm);
+    proc->launched = 0;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `clone_proc` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def clone_proc(old, pid, pml4, stack, hvm):
+    cond = z3.And(
+        z3.And(pid > 0, pid < dt.NPROC),
+        old.procs[pid].state == dt.proc_state.PROC_UNUSED,
+
+        z3.ULT(pml4, dt.NPAGE),
+        old.pages[pml4].type == dt.page_type.PAGE_TYPE_FREE,
+
+        z3.ULT(stack, dt.NPAGE),
+        old.pages[stack].type == dt.page_type.PAGE_TYPE_FREE,
+
+        z3.ULT(hvm, dt.NPAGE),
+        old.pages[hvm].type == dt.page_type.PAGE_TYPE_FREE,
+
+        z3.Distinct(pml4, stack, hvm),
+    )
+    new = old.copy()
+
+    # Initialize the proc
+    new.procs[pid].ppid = new.current
+    new.procs[pid].state = dt.proc_state.PROC_EMBRYO
+    new.procs[pid].killed = z3.BoolVal(False)
+    new.procs[pid].ipc_from = z3.BitVecVal(0, dt.pid_t)
+    new.procs[pid].ipc_val = z3.BitVecVal(0, dt.uint64_t)
+    new.procs[pid].ipc_page = z3.BitVecVal(0, dt.pn_t)
+    new.procs[pid].ipc_size = z3.BitVecVal(0, dt.size_t)
+    new.procs[pid].ipc_fd = z3.BitVecVal(0, dt.fd_t)
+    new.procs[pid].use_io_bitmap = z3.BoolVal(False)
+    new.procs[pid].io_bitmap_a = z3.BitVecVal(0, dt.pn_t)
+    new.procs[pid].io_bitmap_b = z3.BitVecVal(0, dt.pn_t)
+
+    # all refcnts should be zero at this point (according to invariants):
+    # no need to zero them
+    # new.proc_nr_pages = 0
+    # new.proc_nr_children = 0
+    # new.procs.nr_fds = 0
+    # new.proc_nr_devs = 0
+
+    new.procs[pid].ofile = z3.BitVecVal(0, dt.fn_t)
+    new.procs[pid].intr = z3.BitVecVal(0, 64)
+
+    # Maintain the "shadow" pgtable
+    new.pages[pml4].pgtable_pn = z3.BitVecVal(0, 64)
+    new.pages[pml4].pgtable_perm = z3.BitVecVal(0, 64)
+    new.pages[pml4].pgtable_type = dt.PGTYPE_NONE
+
+    # Claim the root pml4, the stack and hvm pages
+    # We need to do four things to claim a page.
+    # 1) Change the type from free to something else
+    # 2) change the owner
+    # 3) zero the page contents
+    # 4) bump the refcount for the owner
+    new.pages[pml4].type = dt.page_type.PAGE_TYPE_X86_PML4
+    new.pages[pml4].owner = pid
+    new.pages[pml4].data = z3.BitVecVal(0, 64)
+    new.procs[pid].nr_pages[pml4] += 1
+
+    new.pages[stack].type = dt.page_type.PAGE_TYPE_PROC_DATA
+    new.pages[stack].owner = pid
+    new.pages[stack].data = z3.BitVecVal(0, 64)
+    new.procs[pid].nr_pages[stack] += 1
+
+    new.pages[hvm].type = dt.page_type.PAGE_TYPE_PROC_DATA
+    new.pages[hvm].owner = pid
+    new.pages[hvm].data = z3.BitVecVal(0, 64)
+    new.procs[pid].nr_pages[hvm] += 1
+
+    new.procs[pid].page_table_root = pml4
+    new.procs[pid].stack = stack
+    new.procs[pid].hvm = hvm
+
+    new.procs[new.current].nr_children[pid] += 1
+
+    # Copy parent's hvm to child's hvm
+    new.pages.data = lambda pn, idx, oldfn: \
+        util.If(pn == hvm,
+                oldfn(new.procs[new.current].hvm, idx),
+                oldfn(pn, idx))
+
+    # Copy parent's stack to child's stack
+    new.pages.data = lambda pn, idx, oldfn: \
+        util.If(pn == stack,
+                oldfn(new.procs[new.current].stack, idx),
+                oldfn(pn, idx))
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 5:
+Given a system call `sys_dup2`. 
+
+[Functional Description]:
+The `sys_dup2` system call provides a mechanism for duplicating a file descriptor from one process to another or within the same process. This operation is essential for managing file descriptor tables, allowing processes to redirect input/output streams or share file descriptors between processes. By duplicating a file descriptor, a process can create an alias for an existing file descriptor, enabling flexible file management and inter-process communication.
+The system call begins by validating the specified process identifier to ensure it corresponds to a valid and active process. If the process identifier is invalid, the operation is terminated with an error, as the duplication cannot proceed without a valid target. The system also checks that the process is either the current one or its embryo process, ensuring that the operation is authorized.
+Next, the system verifies the validity of the source file descriptor within the current process. It also validates the source file descriptor exists in the calling process. If the source file descriptor is invalid or does not exist in the calling process, the operation is rejected with an error. This check ensures that the duplication operation is based on a valid file descriptor, preventing errors or undefined behavior.
+The system then checks the validity of the target file descriptor. If the target file descriptor is invalid, the operation is terminated with an error. This validation ensures that the target location for the duplication is within acceptable limits, maintaining the integrity of the file descriptor table.
+If the source and target file descriptors are the same and belong to the same process, the system call does nothing and returns successfully. This behavior aligns with the POSIX standard, which specifies that duplicating a file descriptor to itself should have no effect.
+If the target file descriptor already exists in the target process, the system closes it before proceeding with the duplication.    Closing the file involves updating the process's file descriptor table to mark the descriptor as unused and decrementing the count of open file descriptors for the process. Additionally, the system updates the file's reference count to reflect the decrease of the file references. And if the file is no longer referenced by any process, it resets the file's attributes, including its type, value, offset, and mode of operation, releasing the associated resources. This step guarantees that newfd is free and available for duplication.
+Finally, the system proceeds to duplicate the source file descriptor. The system associates the file descriptor with the file or resource by updating the target process's file descriptor table. The reference count of the file or resource is incremented to reflect its usage, and the number of file descriptors in use by the process is also updated to show the increase of the associated file descriptors. Furthermore, the system updates the metadata of the process and the file to reflect the open status of the file in a new process. This assignment is performed atomically to ensure consistency and correctness during the operation.
+In conclusion, the `sys_dup2` system call is a crucial feature for managing file descriptors in a flexible and efficient manner. It carefully validates inputs, enforces strict permissions, and ensures that the duplication is performed securely and accurately. This design allows processes to manage their file descriptors effectively, contributing to the overall robustness and flexibility of the system's file management architecture.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_dup2(int oldfd, pid_t pid, int newfd)
+{
+    fn_t fn;
+
+    if (!is_pid_valid(pid))
+        return -ESRCH;
+    if (!is_current_or_embryo(pid))
+        return -EACCES;
+    /* oldfd doesn't exist  */
+    if (!is_fd_valid(oldfd))
+        return -EBADF;
+    fn = get_fd(current, oldfd);
+    if (fn == 0)
+        return -EBADF;
+    if (!is_fd_valid(newfd))
+        return -EBADF;
+
+    /* POSIX: do nothing for the same fd */
+    if ((current == pid) && (oldfd == newfd))
+        return 0;
+
+    /* close newfd if it already exists */
+    if (get_fd(pid, newfd) == 0)
+        clear_fd(pid, newfd);
+    set_fd(pid, newfd, fn);
+    return 0;
+}
+
+enum file_type {
+    FD_NONE = 0,
+    FD_PIPE,
+    FD_INODE,
+    FD_SOCKET,
+
+    FD_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct file {
+    enum file_type type;
+    size_t refcnt;
+    uint64_t value;
+    uint64_t omode;
+    size_t offset;
+};
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+extern struct proc proc_table[NPROC];
+
+#define NPAGE 8192  /* maximum number of pages */
+#define NPROC 64    /* maximum number of processes */
+#define NOFILE 16   /* open files per process */
+#define NFILE 128   /* open files per system */
+
+static inline bool is_pid_valid(pid_t pid)
+{
+    return pid > 0 && pid < NPROC;
+}
+
+/* permission check: we allow a pid to modify itself or its embryo */
+static inline bool is_current_or_embryo(pid_t pid)
+{
+    struct proc *proc;
+
+    if (pid == current)
+        return true;
+    proc = get_proc(pid);
+    if (proc->ppid == current && proc->state == PROC_EMBRYO)
+        return true;
+    return false;
+}
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+static inline bool is_fd_valid(int fd)
+{
+    return fd >= 0 && fd < NOFILE;
+}
+
+static inline fn_t get_fd(pid_t pid, int fd)
+{
+    assert(is_fd_valid(fd), "fd must be valid");
+    return get_proc(pid)->ofile[fd];
+}
+
+static inline void clear_fd(pid_t pid, int fd)
+{
+    struct proc *proc;
+    struct file *file;
+
+    proc = get_proc(pid);
+    file = get_file(get_fd(pid, fd));
+    proc->ofile[fd] = 0;
+    --proc->nr_fds;
+    if (--file->refcnt == 0) {
+        file->type = FD_NONE;
+        file->value = 0;
+        file->offset = 0;
+        file->omode = 0;
+    }
+}
+
+extern struct file file_table[NFILE];
+
+static inline struct file *get_file(fn_t fn)
+{
+    assert(is_fn_valid(fn), "fn must be valid");
+    return &file_table[fn];
+}
+
+static inline bool is_fn_valid(fn_t fn)
+{
+    return fn > 0 && fn < NFILE;
+}
+
+static inline void set_fd(pid_t pid, int fd, fn_t fn)
+{
+    struct proc *proc;
+    struct file *file;
+
+    assert(get_fd(pid, fd) == 0, "fd must be valid");
+    proc = get_proc(pid);
+    file = get_file(fn);
+    proc->ofile[fd] = fn;
+    ++proc->nr_fds;
+    ++file->refcnt;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_dup2` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_dup2(old, oldfd, pid, newfd):
+    cond = z3.And(
+        z3.And(pid > 0, pid < dt.NPROC),
+
+        # the pid is either current or an embryo belonging to current
+        z3.Or(pid == old.current,
+              z3.And(
+                  old.procs[pid].ppid == old.current,
+                  old.procs[pid].state == dt.proc_state.PROC_EMBRYO)),
+
+        z3.And(oldfd >= 0, oldfd < dt.NOFILE),
+        z3.And(z3.UGT(old.procs[old.current].ofile(oldfd), 0), z3.ULT(old.procs[old.current].ofile(oldfd), dt.NFILE)),
+
+        z3.And(newfd >= 0, newfd < dt.NOFILE),
+    )
+
+    new1 = old.copy()
+
+    newfn = new1.procs[pid].ofile(newfd)
+
+    # If fn != 0
+
+    new1.procs[pid].ofile[newfd] = z3.BitVecVal(0, dt.fn_t)
+
+    new1.procs[pid].nr_fds[newfd] -= 1
+
+    # decrement file refcnt
+    new1.files[newfn].refcnt[(pid, newfd)] -= 1
+
+    ref = new1.files[newfn].refcnt()
+
+    # If the refcnt is zero, clear the file slot
+
+    new1.files[newfn].type = util.If(ref == 0, dt.file_type.FD_NONE, new1.files[newfn].type)
+    new1.files[newfn].value = util.If(ref == 0, z3.BitVecVal(0, dt.uint64_t), new1.files[newfn].value)
+    new1.files[newfn].offset = util.If(ref == 0, z3.BitVecVal(0, dt.off_t), new1.files[newfn].offset)
+    new1.files[newfn].omode = util.If(ref == 0, z3.BitVecVal(0, dt.uint64_t), new1.files[newfn].omode)
+
+    new2 = util.If(z3.And(z3.UGT(old.procs[pid].ofile(newfd), 0), z3.ULT(old.procs[pid].ofile(newfd), dt.NFILE)), new1, old.copy())
+
+    # un-conditional
+
+    fn = new2.procs[old.current].ofile(oldfd)
+
+    new2.procs[pid].ofile[newfd] = fn
+
+    new2.procs[pid].nr_fds[newfd] += 1
+
+    # bump file refcnt
+    new2.files[fn].refcnt[(pid, newfd)] += 1
+
+    # posix: if fds are the same, do nothing
+
+    new3 = util.If(z3.And(old.current == pid, oldfd == newfd),
+                   old.copy(), new2)
+
+    return cond, util.If(cond, new3, old)
+```
+
+Example 6:
+Given a system call `sys_free_pd`. 
+
+[Functional Description]:
+The `sys_free_pd` system call is designed to deallocate a Page Directory (PD) entry within a process's page table hierarchy, specifically targeting the release of a PD page and its reference in a Page Directory Pointer Table (PDPT). This operation is crucial for managing virtual memory dynamically, allowing processes to free up memory resources that are no longer needed, thus optimizing memory usage and maintaining system stability.
+The system call begins by validating that the source page is valid and is of the correct type, a Page Directory Pointer Table type. It also validates that the source page belongs to the calling process. If these conditions are not met, the operation is terminated with an error, preventing unauthorized or incorrect modifications to the page table hierarchy.
+Next, the system verifies the validity of the specified index within the page directory pointer table. This check ensures that the operation targets a valid entry within the page directory pointer table, preventing out-of-bounds access that could lead to memory corruption. If the index is invalid, the system rejects the operation with an error.
+The system then validates the target page is valid and is of the correct type, a Page Directory, and is owned by the current process. This step is crucial for maintaining the integrity of the memory hierarchy and preventing unauthorized access to memory regions.
+Once all validations are complete, the system retrieves the page directory pointer table entries and checks if the specified slot is valid and present. If the entry is empty, the operation is terminated with an error, as there is no mapping to release. This check prevents unnecessary operations and ensures that only valid mappings are removed.
+The system further verifies that the existing page directory pointer table entry corresponds to the specified page directory by checking if the physical frame number derived from the page directory pointer table entry matches the page directory's expected physiscal address.  This ensures that the correct mapping is being released, preventing accidental removal of unrelated mappings. If the entry does not match, the operation is terminated with an error.
+Once the validations are complete, the system proceeds to free the page directory (PD) page. The owner process of the page is reset and the type of the freed page is set to the expected type. The free process also updates the process's metadata to reflect the decrease in its memory usage, maintaining accurate records for resource tracking and management. Furthermore, the page directory pointer table entry associated with the released memory is cleared by setting the corresponding entry to zero. This effectively removes the PD from the page table hierarchy, invalidating any address mappings associated with it. To ensure that the changes take effect immediately, the system invalidates the Translation Lookaside Buffer (TLB) for the current process. The TLB is a cache of recently used address mappings, and invalidating it ensures that stale mappings are not used after the PD is freed.
+By the end of the operation, the specified PD page is fully deallocated, and its entry in the PDPT is cleared. This allows the resources to be reused for other purposes while maintaining the consistency of the page table hierarchy. The `sys_free_pd` system call, therefore, is a critical component of memory management, allowing processes to dynamically release memory when it is no longer needed. Its design ensures that memory is safely deallocated, preventing resource leaks and ensuring that mappings remain consistent and secure.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_free_pd(pn_t from, size_t index, pn_t to)
+{
+    return free_page_table_page(from, index, to, PAGE_TYPE_X86_PDPT, PAGE_TYPE_X86_PD);
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc page_desc_table[NPAGE] __aligned(PAGE_SIZE);
+
+extern struct proc proc_table[NPROC];
+
+static int free_page_table_page(pn_t from_pn, size_t index, pn_t to_pn, enum page_type from_type,
+                                enum page_type to_type)
+{
+    pte_t *entries;
+
+    if (!is_page_type(from_pn, from_type))
+        return -EINVAL;
+    if (!is_page_pid(from_pn, current))
+        return -EACCES;
+    if (!is_page_index_valid(index))
+        return -EINVAL;
+    if (!is_page_type(to_pn, to_type))
+        return -EINVAL;
+    if (!is_page_pid(to_pn, current))
+        return -EACCES;
+
+    entries = get_page(from_pn);
+    /* check if the slot is empty */
+    if (!pte_valid(entries[index]))
+        return -EINVAL;
+    /* check if the entry matches */
+    if (pn_to_pfn(to_pn) != (PTE_ADDR(entries[index]) >> PAGE_SHIFT))
+        return -EINVAL;
+
+    /* release the next-level page */
+    free_page(to_pn);
+    /* wipe the entry */
+    entries[index] = 0;
+    hvm_invalidate_tlb(current);
+
+    return 0;
+}
+
+#define PTE_ADDR(pte) ((physaddr_t)(pte)&BITMASK64(51, 12))
+#define PAGE_SHIFT 12
+
+static inline bool pte_valid(uintptr_t x)
+{
+    return x & PTE_P;
+}
+
+static inline pn_t pn_to_pfn(pn_t pn)
+{
+    pn_t pfn0 = (uintptr_t)pages / PAGE_SIZE;
+
+    assert(is_pn_valid(pn), \"pn must be valid\");
+    return pfn0 + pn;
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_page_pid(pn_t pn, pid_t pid)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->pid == pid;
+}
+
+static inline bool is_page_index_valid(size_t index)
+{
+    return index < 512;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), \"pn must be valid\");
+    return pages + pn;
+}
+
+/* insert new after head */
+#define FREELIST_ADD(arr, member, new, head)        \\
+({                                                  \\
+    typeof(&arr->member) enew = &arr[new].member;   \\
+    typeof(&arr->member) ehead = &arr[head].member; \\
+    enew->next = ehead->next;                       \\
+    enew->prev = head;                              \\
+    arr[enew->next].member.prev = new;              \\
+    ehead->next = new;                              \\
+})
+
+void free_page(pn_t pn)
+{
+    struct page_desc *desc = get_page_desc(pn);
+    pid_t pid = desc->pid;
+
+    assert(!is_page_type(pn, PAGE_TYPE_FREE), \"must not be a free page\");
+    desc->pid = 0;
+    desc->type = PAGE_TYPE_FREE;
+
+    if (pn != 0)
+        FREELIST_ADD(page_desc_table, link, pn, 0);
+
+    if (pid)
+        --get_proc(pid)->nr_pages;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), \"page number must be valid\");
+    return &page_desc_table[pn];
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_free_pd` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_free_pd(old, frm, index, to):
+    cond = z3.And(
+        # The frm pn has the correct type and owned by current
+        z3.ULT(frm, dt.NPAGE),
+        old.pages[frm].type == dt.page_type.PAGE_TYPE_X86_PDPT,
+        old.pages[frm].owner == old.current,
+
+        # Index is a valid page index
+        z3.ULT(index, 512),
+
+        # The to pn has the correct type and owned by current
+        z3.ULT(to, dt.NPAGE),
+        old.pages[to].type == dt.page_type.PAGE_TYPE_X86_PD,
+        old.pages[to].owner == old.current,
+
+        # index does have the P bit in the from page
+        old.pages[frm].data(index) & dt.PTE_P != 0,
+
+        # The current pgtable entry matches to...
+        z3.Extract(63, 40, z3.UDiv(old.pages_ptr_to_int,
+                                   z3.BitVecVal(dt.PAGE_SIZE, 64)) + to) == z3.BitVecVal(0, 24),
+        z3.Extract(39, 0, z3.UDiv(old.pages_ptr_to_int, z3.BitVecVal(
+            dt.PAGE_SIZE, 64)) + to) == z3.Extract(51, 12, old.pages[frm].data(index)),
+    )
+
+    new = old.copy()
+
+    new.pages[frm].data[index] = z3.BitVecVal(0, 64)
+
+    new.pages[to].owner = z3.BitVecVal(0, dt.pid_t)
+    new.pages[to].type = dt.page_type.PAGE_TYPE_FREE
+
+    new.procs[old.current].nr_pages[to] -= 1
+
+    new.flush_tlb(old.current)
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 7:
+Given a system call `sys_free_pt`. 
+
+[Functional Description]:
+The `sys_free_pt` system call is designed to deallocate a specific entry in a page table hierarchy by freeing a Page Table (PT) page and removing its reference from a higher-level Page Directory (PD). This operation is crucial for dynamic memory management in virtual memory systems, where hierarchical page tables manage address mappings. The system call ensures that the memory associated with a PT page is properly released and no longer accessible, while maintaining the integrity of the page table structure.
+The system call begins by validating that the source page directory is valid and is of the correct type, a Page Directory type. It also validates that the source page directory belongs to the calling process. It ensures that the page directory corresponds to the expected type and is owned by the current process. If these conditions are not met, the operation is terminated with an error, preventing unauthorized or incorrect modifications to the page table hierarchy.
+Next, the system verifies the validity of the specified index within the page directory. This check ensures that the operation targets a valid entry within the directory, preventing out-of-bounds access that could lead to memory corruption. If the index is invalid, the system rejects the operation with an error.
+The system then validates the target page table is valid and is of the correct type, a Page Table. It ensures that the target page table corresponds to the expected type and is owned by the current process. This step is crucial for maintaining the integrity of the memory hierarchy and preventing unauthorized access to memory regions.
+Once all validations are complete, the system retrieves the page directory entries and checks if the specified slot is valid and present. If the entry is empty, the operation is terminated with an error, as there is no mapping to release. This check prevents unnecessary operations and ensures that only valid mappings are removed.
+The system further verifies that the existing page directory entry corresponds to the specified page table by checking if the physical frame number derived from the page directory entry matches the page table's expected physiscal address. This ensures that the correct mapping is being released, preventing accidental removal of unrelated mappings. If the entry does not match, the operation is terminated with an error.
+Once the validations are complete, the system proceeds to free the page table (PT) page.  The owner process of the page is reset and the type of the freed page is set to the expected type. The free process also updates the process's metadata to reflect the decrease in its memory usage, maintaining accurate records for resource tracking and management. Furthermore, the page directory entry associated with the released memory is cleared by setting the corresponding entry to zero. This effectively removes the PT from the page table hierarchy, invalidating any address mappings associated with it. To ensure that the changes take effect immediately, the system invalidates the Translation Lookaside Buffer (TLB) for the current process. The TLB is a cache of recently used address mappings, and invalidating it ensures that stale mappings are not used after the PT is freed.
+By the end of the operation, the specified PT page is fully deallocated, and its entry in the PD table is cleared. This allows the resources to be reused for other purposes while maintaining the consistency of the page table hierarchy. The `sys_free_pt` system call, therefore, is a critical component of memory management, allowing processes to dynamically release memory when it is no longer needed. Its design ensures that memory is safely deallocated, preventing resource leaks and ensuring that mappings remain consistent and secure.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_free_pt(pn_t from, size_t index, pn_t to)
+{
+    return free_page_table_page(from, index, to, PAGE_TYPE_X86_PD, PAGE_TYPE_X86_PT);
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc page_desc_table[NPAGE] __aligned(PAGE_SIZE);
+
+extern struct proc proc_table[NPROC];
+
+static int free_page_table_page(pn_t from_pn, size_t index, pn_t to_pn, enum page_type from_type,
+                                enum page_type to_type)
+{
+    pte_t *entries;
+
+    if (!is_page_type(from_pn, from_type))
+        return -EINVAL;
+    if (!is_page_pid(from_pn, current))
+        return -EACCES;
+    if (!is_page_index_valid(index))
+        return -EINVAL;
+    if (!is_page_type(to_pn, to_type))
+        return -EINVAL;
+    if (!is_page_pid(to_pn, current))
+        return -EACCES;
+
+    entries = get_page(from_pn);
+    /* check if the slot is empty */
+    if (!pte_valid(entries[index]))
+        return -EINVAL;
+    /* check if the entry matches */
+    if (pn_to_pfn(to_pn) != (PTE_ADDR(entries[index]) >> PAGE_SHIFT))
+        return -EINVAL;
+
+    /* release the next-level page */
+    free_page(to_pn);
+    /* wipe the entry */
+    entries[index] = 0;
+    hvm_invalidate_tlb(current);
+
+    return 0;
+}
+
+#define PTE_ADDR(pte) ((physaddr_t)(pte)&BITMASK64(51, 12))
+#define PAGE_SHIFT 12
+
+static inline bool pte_valid(uintptr_t x)
+{
+    return x & PTE_P;
+}
+
+static inline pn_t pn_to_pfn(pn_t pn)
+{
+    pn_t pfn0 = (uintptr_t)pages / PAGE_SIZE;
+
+    assert(is_pn_valid(pn), \"pn must be valid\");
+    return pfn0 + pn;
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_page_pid(pn_t pn, pid_t pid)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->pid == pid;
+}
+
+static inline bool is_page_index_valid(size_t index)
+{
+    return index < 512;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), \"pn must be valid\");
+    return pages + pn;
+}
+
+/* insert new after head */
+#define FREELIST_ADD(arr, member, new, head)        \\
+({                                                  \\
+    typeof(&arr->member) enew = &arr[new].member;   \\
+    typeof(&arr->member) ehead = &arr[head].member; \\
+    enew->next = ehead->next;                       \\
+    enew->prev = head;                              \\
+    arr[enew->next].member.prev = new;              \\
+    ehead->next = new;                              \\
+})
+
+void free_page(pn_t pn)
+{
+    struct page_desc *desc = get_page_desc(pn);
+    pid_t pid = desc->pid;
+
+    assert(!is_page_type(pn, PAGE_TYPE_FREE), \"must not be a free page\");
+    desc->pid = 0;
+    desc->type = PAGE_TYPE_FREE;
+
+    if (pn != 0)
+        FREELIST_ADD(page_desc_table, link, pn, 0);
+
+    if (pid)
+        --get_proc(pid)->nr_pages;
+}
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), \"pid must be valid\");
+    return &proc_table[pid];
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), \"page number must be valid\");
+    return &page_desc_table[pn];
+}
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_free_pt` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_free_pt(old, frm, index, to):
+    cond = z3.And(
+        # The frm pn has the correct type and owned by current
+        z3.ULT(frm, dt.NPAGE),
+        old.pages[frm].type == dt.page_type.PAGE_TYPE_X86_PD,
+        old.pages[frm].owner == old.current,
+
+        # Index is a valid page index
+        z3.ULT(index, 512),
+
+        # The to pn has the correct type and owned by current
+        z3.ULT(to, dt.NPAGE),
+        old.pages[to].type == dt.page_type.PAGE_TYPE_X86_PT,
+        old.pages[to].owner == old.current,
+
+        # index does have the P bit in the from page
+        old.pages[frm].data(index) & dt.PTE_P != 0,
+
+        # The current pgtable entry matches to...
+        z3.Extract(63, 40, z3.UDiv(old.pages_ptr_to_int,
+                                   z3.BitVecVal(dt.PAGE_SIZE, 64)) + to) == z3.BitVecVal(0, 24),
+        z3.Extract(39, 0, z3.UDiv(old.pages_ptr_to_int, z3.BitVecVal(
+            dt.PAGE_SIZE, 64)) + to) == z3.Extract(51, 12, old.pages[frm].data(index)),
+    )
+
+    new = old.copy()
+
+    new.pages[frm].data[index] = z3.BitVecVal(0, 64)
+
+    new.pages[to].owner = z3.BitVecVal(0, dt.pid_t)
+    new.pages[to].type = dt.page_type.PAGE_TYPE_FREE
+
+    new.procs[old.current].nr_pages[to] -= 1
+
+    new.flush_tlb(old.current)
+
+    return cond, util.If(cond, new, old)
+```

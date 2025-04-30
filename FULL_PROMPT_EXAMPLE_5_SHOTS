@@ -1,0 +1,2388 @@
+You will be provided with four sections displayed below, including verification assumption, programming model, a few examples, and a task question.
+The operating system kernel verification will be performed under the verification assumption. The programming model is a set of Python classes, fields, constants, and functions confining the syntax and semantics of the state-machine specification. The state-machine specification of a system call must only use the classes, fields, constants, and functions defined in the programming model.
+To aid in your understanding of the task, you will be provided with several examples of system calls, each comprising a functional description, a potentially buggy code implementation, and the corresponding state-machine specification, which strictly adheres to the provided programming model.
+Then, you will be given with a user question that includes the functional description and a potentially buggy code implementation of a system call. Your task is to synthesize the corresponding state-machine specification that verifies the functional correctness of the given system call.
+
+### Verification Assumption:
+The kernel's interfaces consist of 50 system calls, providing support for processes, virtual memory, file descriptors, devices, inter-process communication, and scheduling.
+The kernel provides the abstraction of a process using Intel VT-x and AMD-V virtualization support. It runs as a host and user processes run as guests (in ring 0). Trap handlers are implemented as VM-exit handlers, in response to hypercalls (to implement system calls), preemption timer expiration, exceptions, and interrupts. The approach firstly allows the kernel and user space to have separate page tables; the kernel simply uses an identity mapping for its own address space, sidestepping reasoning about virtual-to-physical mapping for kernel code. Secondly, the use of virtualization safely exposes the interrupt descriptor table (IDT) to user processes. This allows the CPU to deliver exceptions (e.g. general protection or page fault) directly to user space, removing the kernel from most exception-handling paths.
+Besides, the kernel requires user space to explicitly make resource allocation decisions. For instance, a system call for page allocation requires user space to provide a page number. The kernel simply checks whether the given resource is free, rather than searching for a free one itself. It avoids loops in the kernel and avoids reasoning about linked data structures, e.g. lists and trees.
+Furthermore, the memory layout of the kernel contains three categories of memory regions: 1. Boot memory is used during kernel initialization only (e.g., for the kernel’s identity-mapping page table) and freezes after booting. 2. The main chunk of memory is used to keep kernel metadata for resources (e.g., processes, files, and pages), as well as “RAM pages” holding kernel and user data. 3. There are two volatile memory regions: DMA pages, which restrict DMA; and PCI pages (i.e., the “PCI hole”), which are mapped to device registers. “RAM pages” are typed similarly to seL4: the user processes retype pages through system calls, for instance, turning a free page into a page-table page, a page frame, or a stack. The kernel uses page metadata to track the type and ownership of each page and decide whether to allow such system calls.
+Additionally, the kernel sidesteps concurrency issues that arise from I/O devices, namely, interrupts and direct memory access (DMA), as follows. First, the kernel executes trap handlers with interrupts disabled, postponing interrupts until the execution returns to user space (which will trap back into the kernel). By doing so, each trap handler runs to completion in the kernel. Second, since devices may asynchronously modify memory through DMA, the kernel isolates their effects by restricting DMA to a dedicated memory region (referred to as DMA pages); this isolation is implemented through mechanisms such as Intel’s VT-d Protected Memory Regions and AMD’s Device Exclusion Vector configured at boot time. In addition, the kernel conservatively considers DMA pages volatile, where memory reads return arbitrary values. In doing so, a DMA write that occurs during kernel execution is effectively equivalent to a no-op with respect to the kernel state, removing the need to explicitly model DMA.
+The kernel has some limitations. It does not support threads, copy-on-write fork, shared pages, or Unix permissions. Additionally, the kernel runs on a uniprocessor system and does not provide multicore support.
+The kernel’s execution is modeled as a state machine as follows:
+A state transition can occur in response to either trap handling or user-space execution (without trapping into the kernel). By design, the execution of a trap handler in the kernel is atomic: it traps from user space into the kernel due to system calls, exceptions, or interrupts, runs to completion, and returns to user space. This atomicity simplifies verification by ruling out interleaved execution, allowing the verifier to reason about each trap handler in its entirety and independently.
+The verification for the functional correctness of the kernel uses the declarative specification provided in the task, and the state-machine specification, which consists of two parts: a definition of abstract kernel state and a definition of trap handlers (e.g., system calls) in terms of abstract state transitions. This is based on several assumptions about the kernel and the corresponding hardware. The kernel has two base assumptions. First, the kernel runs on a uniprocessor system with interrupts disabled. Thus, every system call is therefore atomic and runs to completion. Second, the kernel is in a separate address space from the user space, using identity mapping for virtual memory. Additionally, the kernel also assumes the correctness of hardware, such as CPU, memory, and IOMMU.
+The verification proves the two theorems: 1. The kernel implementation is a refinement of the state-machine specification. 2. The state-machine specification satisfies the declarative specification. The first theorem assumes that both start in equivalent states and the representation invariant holds, proving that they transition to equivalent states and the representation invariant still holds. Before the system call, the state-machine specification and implementation states are equivalent. After the system call, the kernel states and other modeling data structures in the state-machine specification are correctly updated. To prove the second theorem, the state-machine specification and the declarative specification are translated into SMT and checks that the declarative specification holds after each state transition assuming that it held beforehand.
+
+
+### Programming Model:
+The constant and class modeling for kernel state transition is as follows. The generated kernel state-machine specifications should be composed of the constants, the functions, the classes, and their fields within the scope of the modeling.
+
+# Internal Objects:
+# These are populated from llvm metadata info
+intremap_state = {IR_FREE: z3.BitVecVal(0, 64), IR_FORCE_WIDTH: z3.BitVecVal(18446744073709551615, 64), IR_ACTIVE: z3.BitVecVal(1, 64)}
+file_type = {FD_INODE: z3.BitVecVal(2, 64), FD_SOCKET: z3.BitVecVal(3, 64), FD_NONE: z3.BitVecVal(0, 64), FD_FORCE_WIDTH: z3.BitVecVal(18446744073709551615, 64), FD_PIPE: z3.BitVecVal(1, 64)}
+proc_state = {PROC_EMBRYO: z3.BitVecVal(1, 64), PROC_RUNNABLE: z3.BitVecVal(2, 64), PROC_UNUSED: z3.BitVecVal(0, 64), PROC_RUNNING: z3.BitVecVal(3, 64), PROC_STATE_FORCE_WIDTH: z3.BitVecVal(18446744073709551615, 64), PROC_SLEEPING: z3.BitVecVal(4, 64), PROC_ZOMBIE: z3.BitVecVal(5, 64)}
+page_type = {PAGE_TYPE_IOMMU_PT: z3.BitVecVal(11, 64), PAGE_TYPE_IOMMU_PML4: z3.BitVecVal(8, 64), PAGE_TYPE_X86_PD: z3.BitVecVal(6, 64), PAGE_TYPE_RESERVED: z3.BitVecVal(1, 64), PAGE_TYPE_IOMMU_PD: z3.BitVecVal(10, 64), PAGE_TYPE_X86_PDPT: z3.BitVecVal(5, 64), PAGE_TYPE_X86_PML4: z3.BitVecVal(4, 64), PAGE_TYPE_X86_PT: z3.BitVecVal(7, 64), PAGE_TYPE_PROC_DATA: z3.BitVecVal(2, 64), PAGE_TYPE_FORCE_WIDTH: z3.BitVecVal(18446744073709551615, 64), PAGE_TYPE_FRAME: z3.BitVecVal(3, 64), PAGE_TYPE_FREE: z3.BitVecVal(0, 64), PAGE_TYPE_IOMMU_FRAME: z3.BitVecVal(12, 64), PAGE_TYPE_IOMMU_PDPT: z3.BitVecVal(9, 64)}    
+
+```python
+# Constants:
+intremap_state_t = z3.BitVecSort(64)
+file_type_t = z3.BitVecSort(64)
+proc_state_t = z3.BitVecSort(64)
+page_type_t = z3.BitVecSort(64)
+
+PAGE_SIZE = 4096
+
+PCI_START = 0xa0000000
+PCI_END = 0x100000000
+
+NPAGE = 8192
+NDMAPAGE = 512
+NPROC = 64
+# NTSLICE
+NOFILE = 16
+NFILE = 128
+NPCIDEV = 64
+NINTREMAP = 8
+NPCIPAGE = (PCI_END - PCI_START) / PAGE_SIZE
+
+bool_t = z3.BoolSort()
+
+size_t = z3.BitVecSort(64)
+uint64_t = z3.BitVecSort(64)
+uint32_t = z3.BitVecSort(32)
+uint16_t = z3.BitVecSort(16)
+uint8_t = z3.BitVecSort(8)
+
+ssize_t = z3.BitVecSort(64)
+int64_t = z3.BitVecSort(64)
+int32_t = z3.BitVecSort(32)
+int16_t = z3.BitVecSort(16)
+int8_t = z3.BitVecSort(8)
+int = int32_t
+
+pn_t = z3.BitVecSort(64)
+dmapn_t = z3.BitVecSort(64)
+fn_t = z3.BitVecSort(64)
+fd_t = z3.BitVecSort(32)
+pte_t = z3.BitVecSort(64)
+dmar_pte_t = z3.BitVecSort(64)
+pid_t = z3.BitVecSort(64)
+off_t = z3.BitVecSort(64)
+devid_t = z3.BitVecSort(16)
+
+uintptr_t = z3.BitVecSort(64)
+physaddr_t = uintptr_t
+
+INITPID = z3.BitVecVal(1, pid_t)
+
+MAX_INT64 = z3.BitVecVal(2 ** 64 - 1, 64)
+
+def BIT64(bit): return z3.BitVecVal(1 << bit, 64)
+def has_bit(v, bit): return (v & bit) != 0
+
+# Flag bit.
+PTE_P = BIT64(0)                            # present
+PTE_W = BIT64(1)                            # writable
+PTE_U = BIT64(2)                            # user
+PTE_PWT = BIT64(3)                          # write through
+PTE_PCD = BIT64(4)                          # cache disable
+PTE_A = BIT64(5)                            # accessed
+PTE_D = BIT64(6)                            # dirty
+PTE_PS = BIT64(7)                           # page size
+PTE_G = BIT64(8)                            # global
+PTE_AVL = BIT64(9) | BIT64(10) | BIT64(11)  # available for software use
+PTE_NX = BIT64(63)                          # execute disable
+PTE_PERM_MASK = PTE_P | PTE_W | PTE_U | PTE_PWT | PTE_PCD | PTE_AVL | PTE_NX
+
+DMAR_PTE_R = BIT64(0)     # Read
+DMAR_PTE_W = BIT64(1)     # Write
+DMAR_PTE_SNP = BIT64(11)  # Snoop Behaviour
+DMAR_PTE_TM = BIT64(62)   # Transient Mapping
+
+DMAR_PTE_ADDR_SHIFT = z3.BitVecVal(12, uint64_t)
+PTE_PFN_SHIFT = z3.BitVecVal(12, uint64_t)
+
+PGTYPE_PAGE = z3.BitVecVal(0, uint64_t)
+PGTYPE_PROC = z3.BitVecVal(1, uint64_t)
+PGTYPE_PAGE_DESC = z3.BitVecVal(2, uint64_t)
+PGTYPE_FILE_TABLE = z3.BitVecVal(3, uint64_t)
+PGTYPE_DEVICES = z3.BitVecVal(4, uint64_t)
+PGTYPE_PCIPAGE = z3.BitVecVal(5, uint64_t)
+PGTYPE_IOMMU_FRAME = z3.BitVecVal(6, uint64_t)
+PGTYPE_NONE = z3.BitVecVal(7, uint64_t)
+    
+def BIT64(bit): return z3.BitVecVal(1 << bit, 64)
+def has_bit(v, bit): return (v & bit) != 0
+
+# Flag bit.
+PTE_P = BIT64(0)                            # present
+PTE_W = BIT64(1)                            # writable
+PTE_U = BIT64(2)                            # user
+PTE_PWT = BIT64(3)                          # write through
+PTE_PCD = BIT64(4)                          # cache disable
+PTE_A = BIT64(5)                            # accessed
+PTE_D = BIT64(6)                            # dirty
+PTE_PS = BIT64(7)                           # page size
+PTE_G = BIT64(8)                            # global
+PTE_AVL = BIT64(9) | BIT64(10) | BIT64(11)  # available for software use
+PTE_NX = BIT64(63)                          # execute disable
+PTE_PERM_MASK = PTE_P | PTE_W | PTE_U | PTE_PWT | PTE_PCD | PTE_AVL | PTE_NX
+
+DMAR_PTE_R = BIT64(0)     # Read
+DMAR_PTE_W = BIT64(1)     # Write
+DMAR_PTE_SNP = BIT64(11)  # Snoop Behaviour
+DMAR_PTE_TM = BIT64(62)   # Transient Mapping
+
+DMAR_PTE_ADDR_SHIFT = z3.BitVecVal(12, uint64_t)
+PTE_PFN_SHIFT = z3.BitVecVal(12, uint64_t)
+
+PGTYPE_PAGE = z3.BitVecVal(0, uint64_t)
+PGTYPE_PROC = z3.BitVecVal(1, uint64_t)
+PGTYPE_PAGE_DESC = z3.BitVecVal(2, uint64_t)
+PGTYPE_FILE_TABLE = z3.BitVecVal(3, uint64_t)
+PGTYPE_DEVICES = z3.BitVecVal(4, uint64_t)
+PGTYPE_PCIPAGE = z3.BitVecVal(5, uint64_t)
+PGTYPE_IOMMU_FRAME = z3.BitVecVal(6, uint64_t)
+PGTYPE_NONE = z3.BitVecVal(7, uint64_t)
+
+NPAGES_PAGES = NPAGE
+NPAGES_PROC_TABLE = 6
+NPAGES_FILE_TABLE = 2
+NPAGES_PAGE_DESC_TABLE = 64
+NPAGES_DEVICES = 2
+
+# Classes:
+
+class Accessor(object):
+    def __init__(self, field, instance, imap):
+        self._field = field
+        self._instance = instance
+        self._imap = imap
+
+    def __repr__(self):
+        return "Partial application of {!r}{!r}".format(self._instance._fields[self._field], tuple(self._instance._path))
+
+    def __call__(self, *args):
+        instance = self._instance
+        for i in args:
+            instance = instance[i]
+        return self._imap(instance)
+
+    def __getattr__(self, attr):
+        val = getattr(self._imap, attr)
+        if isinstance(val, types.MethodType):
+            return lambda *args, **kwargs: val(self._instance, *args, **kwargs)
+        else:
+            return val
+
+    def __getitem__(self, arg):
+        return Accessor(self._field, self._instance[arg], self._imap)
+
+    def __setitem__(self, arg, value):
+        return setattr(self._instance[arg], self._field, value)
+
+    def __iadd__(self, value):
+        return self._imap.__iadd__(self._instance, value)
+
+    def __sub__(self, value):
+        return self._imap.__isub__(self._instance, value)
+
+class AbstractMap(object):
+    def __init__(self, *types):
+        global _order
+        self._order = _order
+        _order += 1
+
+        self._name = None
+        self._arity = len(types) - 1
+        self._types = types
+
+    def get_arity(self):
+        return self._arity
+
+    def get_types(self):
+        return self._types
+
+    def invariants(self):
+        return []
+
+    def initial(self, instance):
+        pass
+
+    def _init(self, obj, name, prefix=None):
+        if prefix:
+            self._prefix = prefix + '_'
+        else:
+            self._prefix = ''
+
+        self._name = name
+        obj._fields[self._name] = self.new()
+
+    def __get__(self, instance, owner=None):
+        f = instance._fields[self._name]
+
+        if len(instance._path) < self.get_arity():
+            return Accessor(self._name, instance, self)
+        elif self._arity == len(instance._path):
+            return self.get(f, instance._path)
+        else:
+            raise TypeError('Too many arguments to function: expected arguments: {!r}'.format(self._types))
+
+    def __call__(self, instance):
+        return self.__get__(instance)
+
+    def __set__(self, instance, value):
+        assert len(instance._path) <= self.get_arity()
+        instance._fields[self._name] = self.set(instance._fields[self._name], instance._path, value)
+
+    def __iadd__(self, instance, value):
+        return self.iadd(instance._fields[self._name], instance._path, value)
+
+    def __isub__(self, instance, value):
+        return self.isub(instance._fields[self._name], instance._path, value)
+
+    def new(self):
+        raise NotImplementedError()
+
+    def get(self):
+        raise NotImplementedError()
+
+    def iadd(self):
+        raise NotImplementedError()
+
+    def isub(self):
+        raise NotImplementedError()
+
+class StructMeta(type):
+    def __new__(cls, name, parents, dct):
+        meta = collections.OrderedDict()
+        for k, v in sorted(dct.items(), key=lambda v: getattr(v[1], '_order', float('inf'))):
+            if hasattr(v, '_init'):
+                meta[k] = v
+            if getattr(v, '__metaclass__', None) == cls:
+                meta[k] = v.__class__
+                del dct[k]
+        dct['_meta'] = meta
+        return super(StructMeta, cls).__new__(cls, name, parents, dct)
+
+class Struct(object):
+    __frozen = False
+    __metaclass__ = StructMeta
+
+    def __init__(self):
+        global _order
+        self._order = _order
+        _order += 1
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def _init(self, parent, name):
+        self._fields = {}
+        self._structs = collections.OrderedDict()
+        self._path = []
+
+        for k, v in self._meta.items():
+            if isinstance(v, type):
+                self._structs[k] = v()
+                self._structs[k]._init(self, k)
+            else:
+                v._init(self, k, prefix=name)
+
+        for k, v in self._structs.items():
+            v = copy.copy(v)
+            self._structs[k] = v
+            v._init(self, k)
+        self.__frozen = True
+
+    def __getattribute__(self, arg):
+        if arg.startswith('_'):
+            return super(Struct, self).__getattribute__(arg)
+
+        if arg not in self._meta:
+            return super(Struct, self).__getattribute__(arg)
+
+        if arg in self._structs:
+            return self._structs[arg]
+        else:
+            return super(Struct, self).__getattribute__(arg)
+
+    def __setattr__(self, attribute, value):
+        if self.__frozen and not attribute in self.__dict__ and not attribute in self._meta:
+            raise AttributeError("No such attribute: '{}'".format(attribute))
+        return super(Struct, self).__setattr__(attribute, value)
+
+    def __getitem__(self, value):
+        # shallow copy of self
+        other = copy.copy(self)
+        # deep copy of the path
+        other._path = copy.deepcopy(self._path)
+        other._path.append(value)
+        return other
+
+    def invariants(self, conj=None):
+        if conj is None:
+            conj = []
+        for k, v in self._meta.items():
+            if k in self._structs:
+                v = self._structs[k]
+            for c in v.invariants():
+                conj.append(c)
+        return conj
+
+    def initial(self):
+        kp = self.copy()
+        for k, v in kp._meta.items():
+            if k in kp._structs:
+                kp._structs[k] = kp._structs[k].initial()
+            else:
+                v.initial(kp)
+        return kp
+
+    def ite(self, other, cond):
+        assert self.__class__ == other.__class__
+        new = copy.copy(self)
+        new._fields = util.If(cond, self._fields, other._fields)
+        new._structs = util.If(cond, self._structs, other._structs)
+        return new
+
+class BaseStruct(Struct):
+    def __init__(self):
+        self._init(None, None)
+
+class Map(AbstractMap):
+    def new(self):
+        if self.get_arity() == 0:
+            types = self.get_types()
+            assert len(types) == 1
+            typ = types[0]
+            if typ == z3.BoolSort():
+                value = util.FreshBool(self._prefix + self._name)
+            else:
+                value = util.FreshBitVec(self._prefix + self._name, typ)
+        else:
+            value = util.FreshFunction(self._prefix + self._name, *self.get_types())
+        return value
+
+    def get(self, fn, args):
+        if args:
+            return fn(*args)
+        else:
+            return fn
+
+    def set(self, old, args, value):
+        # "raw" assignment of a lambda without any accessor arguments
+        if isinstance(value, types.FunctionType):
+            assert not args
+            return lambda *args: value(*args, oldfn=old)
+        elif self.get_arity() == 0:
+            # assignment to a value
+            return value
+        else:
+            # assignment with value with partial arguments
+            return util.partial_update(old, args, value)
+
+class Refcnt(Map):
+    # Refcount based on permuting the set of `owned` objects.
+    def __init__(self, *args, **kwargs):
+        self._initial_offset = kwargs.pop('initial_offset', 0)
+        super(Refcnt, self).__init__(*args, **kwargs)
+
+    def __call__(self, instance, owner=None):
+        f = instance._fields[self._name]
+        assert len(instance._path) == 1
+        return self.get(f, instance._path)
+
+    def new(self):
+        assert self.get_arity() == 2
+        owner, owned, size = self.get_types()
+        ref = util.FreshFunction(self._prefix + self._name, owner, size)
+        perm = util.FreshFunction(self._prefix + self._name, owner, size, owned)
+        perm_inv = util.FreshFunction(self._prefix + self._name, owner, owned, size)
+        return (ref, perm, perm_inv)
+
+    def check(self, instance, conj, is_owner_valid, is_owned_valid, max_refs, ownerfn=None, ownedby=None):
+        # Emit correctness definitions for this refcnt.
+
+        assert ownerfn != None or ownedby != None
+        assert not (ownerfn and ownedby)
+
+        if ownerfn:
+            ownedby = lambda arg1, arg2: ownerfn(arg2) == arg1
+
+        fn = instance._fields[self._name]
+        owner = util.FreshBitVec('owner', self.get_types()[0])
+        owned = util.FreshBitVec('owned', self.get_types()[1])
+        idx = util.FreshBitVec('idx', self.get_types()[2])
+
+        ref, perm, perm_inv = fn
+
+        # 1) a valid input implies a valid owned output
+        conj.append(z3.ForAll([owner, owned], z3.Implies(is_owner_valid(owner),
+            z3.Implies(is_owned_valid(owned),
+                z3.ULT(perm_inv(owner, owned), max_refs)
+        ))))
+
+        # 2) The function is a bijection
+        conj.append(z3.ForAll([owner, owned, idx],
+            z3.Implies(z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned),
+                z3.ULT(idx, max_refs)),
+            z3.And(
+                perm_inv(owner, perm(owner, idx)) == idx,
+                perm(owner, perm_inv(owner, owned)) == owned,
+        ))))
+
+        # 3) if 'owner' owns 'owned', then f(owned) < ref, otherwise f(owned) >= ref
+        conj.append(z3.ForAll([owner, owned], z3.Implies(
+            z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned),
+            ),
+            z3.And(
+                z3.Implies(ownedby(owner, owned),
+                    z3.ULT(perm_inv(owner, owned), ref(owner))),
+                z3.Implies(z3.Not(ownedby(owner, owned)),
+                    z3.UGE(perm_inv(owner, owned), ref(owner)))
+            ))))
+
+        # Checks that the refcnt don't overflows, that if its
+        # value is 0 that the owner owns nothing and if its value is max_refs that
+        # process owns all the resources.
+
+        # refcount is in the range 0 <= r <= max_refs
+        conj.append(z3.ForAll([owner],
+            z3.Implies(is_owner_valid(owner), z3.ULE(ref(owner), max_refs))))
+
+        # if refcount is 0, then you own no pages
+        conj.append(z3.ForAll([owner, owned], z3.Implies(
+            z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned),
+                ref(owner) == z3.BitVecVal(0, self.get_types()[-1]),
+            ),
+            z3.Not(ownedby(owner, owned)),
+        )))
+
+        # if refcount is max_refs, then that owner owns all the resources
+        conj.append(z3.ForAll([owner, owned], z3.Implies(
+            z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned),
+                ref(owner) == max_refs
+            ),
+            ownedby(owner, owned),
+        )))
+
+    def set(self, old, args, value):
+        assert isinstance(value, tuple)
+        assert all(map(lambda v: isinstance(v, types.FunctionType), value))
+        return value
+
+    def get(self, fn, args):
+        return fn[0](*args)
+
+    def iadd(self, old, args, value):
+        assert len(args) == 2
+        assert value == 1
+        ref, perm, perm_inv = old
+
+        refval = ref(args[0])
+        owned = perm(args[0], refval)
+        idx = perm_inv(args[0], args[1])
+
+        ref = util.partial_update(ref, (args[0],), refval + 1)
+
+        # We are modeling the ownership with three functions,
+        # 1) a refcount number: the number of objects owned by `owner`
+        # 2) a function with the property that the first `refval` objects owned by `owner`
+        # 3) a function that is the inverse of 2)
+
+        # For example, consider 5 'ownable' objects in the system,
+        # Where `owner` has 2 objects: 3 and 2. The state might look like:
+        #--------------------------
+        # 3 | 2 | 1 | 4 | 5
+        #--------------------------
+        #         ^
+        #       refval
+        # Now, iadd is incrementing the refcnt by allocating args[2]
+        # To do this we have to swap the current position of args[2] with the
+        # Slot at refval.
+
+        # For example, if args[1] is 5, we update the state by swapping the `1`
+        # at index refval with the index of args[1].
+        #--------------------------
+        # 3 | 2 | 5 | 4 | 1
+        #--------------------------
+        #             ^
+        #           refval
+
+        # Write the new value (args[1]) into position refval and maintain the
+        # inverse function
+        perm = util.partial_update(perm, (args[0], refval), args[1])
+        perm_inv = util.partial_update(perm_inv, (args[0], args[1]), refval)
+
+        # Write the previous value of refval to the previous location of args[1]
+        perm = util.partial_update(perm, (args[0], idx), owned)
+        perm_inv = util.partial_update(perm_inv, (args[0], owned), idx)
+
+        return (ref, perm, perm_inv)
+
+    def initial(self, instance):
+        def trim(var):
+            if var.size() == self.get_types()[1].size():
+                return var
+            return z3.Extract(self.get_types()[1].size() - 1, 0, var)
+        def extend(var):
+            if var.size() < self.get_types()[-1].size():
+                v = z3.ZeroExt(self.get_types()[2].size() - var.size(), var)
+                return v
+            return var
+
+        ref = instance._fields[self._name][0]
+        perm = lambda pid, idx: trim(idx + self._initial_offset)
+        perm_inv = lambda pid, child: extend(child - self._initial_offset)
+        instance._fields[self._name] = (ref, perm, perm_inv)
+
+    def isub(self, old, args, value):
+        assert len(args) == 2
+        assert value == 1
+        ref, perm, perm_inv = old
+
+        ref = util.partial_update(ref, (args[0],), ref(args[0]) - 1)
+
+        refval = ref(args[0])
+        owned = perm(args[0], refval)
+        idx = perm_inv(args[0], args[1])
+
+        perm = util.partial_update(perm, (args[0], refval), args[1])
+        perm_inv = util.partial_update(perm_inv, (args[0], args[1]), refval)
+
+        perm = util.partial_update(perm, (args[0], idx), owned)
+        perm_inv = util.partial_update(perm_inv, (args[0], owned), idx)
+
+        return (ref, perm, perm_inv)
+
+
+class Refcnt2(Map):
+    # Refcount based on permuting the set of `owned` objects.
+    def __call__(self, instance, owner=None):
+        f = instance._fields[self._name]
+        assert len(instance._path) == 1
+        return self.get(f, instance._path)
+
+    def new(self):
+        assert self.get_arity() == 2
+        owner, owned, size = self.get_types()
+        ref = util.FreshFunction(self._prefix + self._name, owner, size)
+        perm1 = util.FreshFunction(self._prefix + self._name, owner, size, owned[0])
+        perm2 = util.FreshFunction(self._prefix + self._name, owner, size, owned[1])
+        perm_inv = util.FreshFunction(self._prefix + self._name, owner, owned[0], owned[1], size)
+        return (ref, perm1, perm2, perm_inv)
+
+    def check(self, instance, conj, is_owner_valid, is_owned1_valid, is_owned2_valid, max_refs, ownerfn=None, ownedby=None):
+        # Emit correctness definitions for this refcnt.
+
+        is_owned_valid = lambda a, b: z3.And(is_owned1_valid(a), is_owned2_valid(b))
+
+        assert ownerfn != None or ownedby != None
+        assert not (ownerfn and ownedby)
+
+        if ownerfn:
+            ownedby = lambda arg1, arg2: ownerfn(arg2) == arg1
+
+        fn = instance._fields[self._name]
+        owner = util.FreshBitVec('owner', self.get_types()[0])
+        owned1 = util.FreshBitVec('owned1', self.get_types()[1][0])
+        owned2 = util.FreshBitVec('owned2', self.get_types()[1][1])
+        idx = util.FreshBitVec('idx', self.get_types()[2])
+
+        ref, perm1, perm2, perm_inv = fn
+
+        # 1) a valid input implies a valid owned output
+        conj.append(z3.ForAll([owner, owned1, owned2], z3.Implies(
+            z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned1, owned2)),
+            z3.ULT(perm_inv(owner, owned1, owned2), max_refs)
+        )))
+
+        conj.append(z3.ForAll([owner, idx], z3.Implies(
+            z3.And(
+                is_owner_valid(owner),
+                z3.ULT(idx, max_refs)),
+            z3.And(
+                is_owned1_valid(perm1(owner, idx)),
+                is_owned2_valid(perm2(owner, idx))))))
+
+        # 2) The function function is a bijection
+        conj.append(z3.ForAll([owner, owned1, owned2, idx],
+            z3.Implies(z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned1, owned2),
+                z3.ULT(idx, max_refs)),
+            z3.And(
+                perm_inv(owner, perm1(owner, idx), perm2(owner, idx)) == idx,
+                perm1(owner, perm_inv(owner, owned1, owned2)) == owned1,
+                perm2(owner, perm_inv(owner, owned1, owned2)) == owned2,
+        ))))
+
+        # 3) if 'owner' owns 'owned', then f(owned) < ref, otherwise w(owned) >= ref
+        conj.append(z3.ForAll([owner, owned1, owned2], z3.Implies(
+            z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned1, owned2),
+            ),
+            z3.And(
+                z3.Implies(ownedby(owner, (owned1, owned2)),
+                    z3.ULT(perm_inv(owner, owned1, owned2), ref(owner))),
+                z3.Implies(z3.Not(ownedby(owner, (owned1, owned2))),
+                    z3.UGE(perm_inv(owner, owned1, owned2), ref(owner)))
+            ))))
+
+        # Checks that the refcnt don't overflows, that if its
+        # value is 0 that the owner owns nothing and if its value is max_refs that
+        # process owns all the resources.
+
+        # refcount is in the range 0 <= r <= max_refs
+        conj.append(z3.ForAll([owner],
+            z3.Implies(is_owner_valid(owner), z3.ULE(ref(owner), max_refs))))
+
+        # if refcount is 0, then you own no pages
+        conj.append(z3.ForAll([owner, owned1, owned2], z3.Implies(
+            z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned1, owned2),
+                ref(owner) == z3.BitVecVal(0, self.get_types()[-1]),
+            ),
+            z3.Not(ownedby(owner, (owned1, owned2))),
+        )))
+
+        # if refcount is max_refs, then that owner owns all the resources
+        conj.append(z3.ForAll([owner, owned1, owned2], z3.Implies(
+            z3.And(
+                is_owner_valid(owner),
+                is_owned_valid(owned1, owned2),
+                ref(owner) == max_refs
+            ),
+            ownedby(owner, (owned1, owned2)),
+        )))
+
+    def initial(self, instance):
+        def trim(var, type):
+            if var.size() == type.size():
+                return var
+            return z3.Extract(type.size() - 1, 0, var)
+        def extend(var):
+            if var.size() < self.get_types()[-1].size():
+                v = z3.ZeroExt(self.get_types()[2].size() - var.size(), var)
+                return v
+            return var
+
+        ref = instance._fields[self._name][0]
+        perm1 = lambda fn, idx: trim(z3.UDiv(idx, 16) + 1 , type=self.get_types()[1][0])
+        perm2 = lambda fn, idx: trim(z3.URem(idx, 16), type=self.get_types()[1][1])
+        perm_inv = lambda fn, owned1, owned2: extend(owned1 - 1) * 16 + extend(owned2 % 16)
+        instance._fields[self._name] = (ref, perm1, perm2, perm_inv)
+
+    def set(self, old, args, value):
+        assert isinstance(value, tuple)
+        assert all(map(lambda v: isinstance(v, types.FunctionType), value))
+        return value
+
+    def get(self, fn, args):
+        return fn[0](*args)
+
+    def iadd(self, old, args, value):
+        assert len(args) == 2
+        assert value == 1
+        ref, perm1, perm2, perm_inv = old
+
+        refval = ref(args[0])
+        owned_x = perm1(args[0], refval)
+        owned_y = perm2(args[0], refval)
+        idx = perm_inv(args[0], *args[1])
+
+        ref = util.partial_update(ref, (args[0],), refval + 1)
+
+        # We are modeling the ownership with three functions,
+        # 1) a refcount number: the number of objects owned by `owner`
+        # 2) a function with the property that the first `refval` objects owned by `owner`
+        # 3) a function that is the inverse of 2)
+
+        # For example, consider 5 'ownable' objects in the system,
+        # Where `owner` has 2 objects: 3 and 2. The state might look like:
+        #--------------------------
+        # 3 | 2 | 1 | 4 | 5
+        #--------------------------
+        #         ^
+        #       refval
+        # Now, iadd is incrementing the refcnt by allocating args[2]
+        # To do this we have to swap the current position of args[2] with the
+        # Slot at refval.
+
+        # For example, if args[1] is 5, we update the state by swapping the `1`
+        # at index refval with the index of args[1].
+        #--------------------------
+        # 3 | 2 | 5 | 4 | 1
+        #--------------------------
+        #             ^
+        #           refval
+
+        # Write the new value (args[1]) into position refval and maintain the
+        # inverse function
+        perm1 = util.partial_update(perm1, (args[0], refval), args[1][0])
+        perm2 = util.partial_update(perm2, (args[0], refval), args[1][1])
+        perm_inv = util.partial_update(perm_inv, (args[0], args[1][0], args[1][1]), refval)
+
+        # Write the previous value of refval to the previous location of args[1]
+        perm1 = util.partial_update(perm1, (args[0], idx), owned_x)
+        perm2 = util.partial_update(perm2, (args[0], idx), owned_y)
+        perm_inv = util.partial_update(perm_inv, (args[0], owned_x, owned_y), idx)
+
+        return (ref, perm1, perm2, perm_inv)
+
+    def isub(self, old, args, value):
+        assert len(args) == 2
+        assert value == 1
+        ref, perm1, perm2, perm_inv = old
+
+        ref = util.partial_update(ref, (args[0],), ref(args[0]) - 1)
+
+        refval = ref(args[0])
+        owned_x = perm1(args[0], refval)
+        owned_y = perm2(args[0], refval)
+        idx = perm_inv(args[0], *args[1])
+
+        perm1 = util.partial_update(perm1, (args[0], refval), args[1][0])
+        perm2 = util.partial_update(perm2, (args[0], refval), args[1][1])
+        perm_inv = util.partial_update(perm_inv, (args[0], args[1][0], args[1][1]), refval)
+
+        perm1 = util.partial_update(perm1, (args[0], idx), owned_x)
+        perm2 = util.partial_update(perm2, (args[0], idx), owned_y)
+        perm_inv = util.partial_update(perm_inv, (args[0], owned_x, owned_y), idx)
+
+        return (ref, perm1, perm2, perm_inv)
+
+class PCI(Struct):
+    owner = Map(devid_t, pid_t)
+    page_table_root = Map(devid_t, pn_t)
+
+class Vectors(Struct):
+    owner = Map(uint8_t, pid_t)
+
+class IO(Struct):
+    owner = Map(uint16_t, pid_t)
+
+class Intremap(Struct):
+    state = Map(size_t, intremap_state_t)
+    devid = Map(size_t, devid_t)
+    vector = Map(size_t, uint8_t)
+
+class Page(Struct):
+    data = Map(pn_t, uint64_t, uint64_t)
+    owner = Map(pn_t, pid_t)
+    type = Map(pn_t, page_type_t)
+
+    pgtable_pn = Map(pn_t, uint64_t, uint64_t)
+    pgtable_perm = Map(pn_t, uint64_t, uint64_t)
+    pgtable_type = Map(pn_t, uint64_t, uint64_t)
+
+    pgtable_reverse_pn = Map(pn_t, pn_t)
+    pgtable_reverse_idx = Map(pn_t, pn_t)
+
+class DMAPage(Struct):
+    owner = Map(pn_t, pid_t)
+    type = Map(pn_t, page_type_t)
+
+class PCIPage(Struct):
+    owner = Map(pn_t, devid_t)
+    valid = Map(pn_t, bool_t)
+
+class Proc(Struct):
+    state = Map(pid_t, proc_state_t)
+    ppid = Map(pid_t, pid_t)
+    killed = Map(pid_t, bool_t)
+
+    ipc_from = Map(pid_t, pid_t)
+    ipc_val = Map(pid_t, uint64_t)
+    ipc_page = Map(pid_t, pn_t)
+    ipc_size = Map(pid_t, size_t)
+    ipc_fd = Map(pid_t, fd_t)
+
+    ofile = Map(pid_t, fd_t, fn_t)
+
+    nr_children = Refcnt(pid_t, pid_t, size_t, initial_offset=1)
+    nr_fds = Refcnt(pid_t, fd_t, size_t)
+    nr_pages = Refcnt(pid_t, pn_t, size_t)
+    nr_dmapages = Refcnt(pid_t, pn_t, size_t)
+    nr_devs = Refcnt(pid_t, devid_t, size_t)
+    nr_ports = Refcnt(pid_t, uint16_t, size_t)
+    nr_vectors = Refcnt(pid_t, uint8_t, size_t)
+    nr_intremaps = Refcnt(pid_t, size_t, size_t)
+
+    stack = Map(pid_t, pn_t)
+    hvm = Map(pid_t, pn_t)
+    page_table_root = Map(pid_t, pn_t)
+
+    use_io_bitmap = Map(pid_t, bool_t)
+    io_bitmap_a = Map(pid_t, pn_t)
+    io_bitmap_b = Map(pid_t, pn_t)
+
+    intr = Map(pid_t, uint64_t, uint64_t)
+
+    tlbinv = Map(pid_t, bool_t)
+
+class File(Struct):
+    type = Map(fn_t, file_type_t)
+    refcnt = Refcnt2(fn_t, (pid_t, fd_t), size_t)
+    value = Map(fn_t, uint64_t)
+    omode = Map(fn_t, uint64_t)
+    offset = Map(fn_t, size_t)
+
+# Global kernel state for state-machine specification
+
+class KernelState(BaseStruct):
+    pages_ptr_to_int = Map(uint64_t)
+    proc_table_ptr_to_int = Map(uint64_t)
+    page_desc_table_ptr_to_int = Map(uint64_t)
+    file_table_ptr_to_int = Map(uint64_t)
+    devices_ptr_to_int = Map(uint64_t)
+    dmapages_ptr_to_int = Map(uint64_t)
+
+    procs = Proc()
+    pages = Page()
+    dmapages = DMAPage()
+    files = File()
+    pci = PCI()
+    pcipages = PCIPage()
+    vectors = Vectors()
+    io = IO()
+    intremaps = Intremap()
+
+    current = Map(pid_t)
+    iotlbinv = Map(bool_t)
+
+    def flush_iotlb(self):
+        self.iotlbinv = z3.BoolVal(True)
+
+    def flush_tlb(self, pid):
+        self.procs[pid].tlbinv = z3.BoolVal(True)
+```
+
+Other than the model above, z3 datatypes and methods are included in the model, such as `z3.ULT()`, `z3.UGT()`, `z3.ULE()`, `z3.UGE()`, `z3.UDiv()`, `z3.And()`, `z3.Or()`, `z3.Not()`, `z3.Extract()`, `z3.BitVecVal()`, `z3.BoolVal()`, `z3.Implies()`, `z3.ZeroExt()`, `z3.Distinct()`, etc., along with lambda functions and the `util.If(cond, a, b)` function, which conceptually computes `ite(cond, a, b)` but tries to simplify out the `ite` if possible and supports more than just plain z3 datatypes. In the state-machine specification, all conditional branches should be encapsulated within the `util.If(cond, a, b)` function. The state-machine specification should not contain any if-else statements.
+The generated state-machine specification must utilize only the classes, fields, internal objects, constants, and functions outlined above. For example, suppose `ks` is an instance of the class `KernelState`, `pn` represents the page number, and `index` indicates the virtual address. `ks.pages[pn]` invokes the `__getitem__` method of the `Struct` class with the argument `pn`, allowing access to the specific page in the kernel state as defined by the programming model. Furthermore, `ks.pages[pn].data` refers to the data map associated with a specific page identified by the page number `pn`. For write access to the data at a specific address specified by `index` in the kernel state, `ks.pages[pn].data[index]` should be used. Conversely, `ks.pages[pn].data(index)` is utilized for read access to retrieve the data at the specified address. `KernelState.flush_iotlb()` calls a function defined within the relevant class to perform its operation. Additionally, the constant data required for the specification resides in the `dt` module. To access these constants and internal objects, use the appropriate module and constant reference, such as `dt.intremap_state.IR_FREE`.
+
+
+### Examples:
+Now, we provide a few examples of system calls, including their functional descriptions, code implementations that may contain bugs, and their corresponding state-machine specifications.
+
+Example 1:
+Given a system call `sys_alloc_port`. 
+
+[Functional Description]:
+The `sys_alloc_port` system call is designed to allocate an I/O port to a process, allowing it to perform input/output operations on that port. This functionality is crucial in systems where processes need direct access to hardware resources, such as peripheral devices, through specific I/O ports. The system call ensures that port allocation is managed securely and efficiently, preventing conflicts and unauthorized access.
+The system call begins by checking if the requested port is already in use. If the port is occupied, the operation is terminated with an error, indicating that the port is unavailable for allocation. This check prevents conflicts and ensures that each port is uniquely assigned to a single process at any given time.
+Once the port's availability is confirmed, the system verifies whether the process is permitted to use the I/O bitmap. If the process lacks this permission, the operation is rejected with an error. This restriction ensures that only authorized processes can allocate ports, maintaining system security and stability.
+If the process is authorized, the system proceeds to allocate the port by marking it as taken by the current process. It updates the I/O bitmap of the process to clear the bit corresponding to the allocated port, effectively granting the process access to the port. The bitmap is divided into two sections, and the system determines which section to update based on the port number. This update ensures that the process has the necessary permissions to access the allocated port.
+Finally, the system increments the count of ports allocated to the process, reflecting the successful allocation. The operation concludes with a success status, indicating that the port has been successfully allocated to the process.
+In summary, the sys_alloc_port system call is a critical mechanism for managing I/O port allocations in a secure and efficient manner. It ensures that ports are uniquely assigned, verifies process permissions, and updates the process's I/O bitmap to reflect the allocation. By providing this functionality, the system call supports processes in performing direct hardware interactions, contributing to the overall flexibility and capability of the system's I/O management.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_alloc_port(uint16_t port)
+{
+    struct proc *proc;
+
+    if (io_table[port])
+        return -EBUSY;
+
+    proc = get_proc(current);
+    if (!proc->use_io_bitmap)
+        return -EACCES;
+
+    io_table[port] = current;
+    if (port < 0x8000)
+        bit_clear(port, get_page(proc->io_bitmap_a));
+    else
+        bit_clear(port - 0x8000, get_page(proc->io_bitmap_b));
+    --proc->nr_ports;
+    return 0;
+}
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+#define NPAGE 8192  /* maximum number of pages */
+#define NPROC 64    /* maximum number of processes */
+#define SZ_64K UINT64_C(0x00010000)
+
+extern struct proc proc_table[NPROC];
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+/*
+ * Map port to owner pid:
+ * 0: free
+ * -1: reserved by kernel
+ * others: taken by pid
+ */
+static pid_t io_table[SZ_64K];
+
+#define _BITSET_BITS       (sizeof(unsigned long) * 8)
+
+#define __bitset_mask(n)   (1UL << ((n) % _BITSET_BITS))
+
+#define __bitset_word(n)   ((n) / _BITSET_BITS)
+
+static inline void bit_clear(size_t n, unsigned long *bits)
+{
+    bits[__bitset_word(n)] &= ~__bitset_mask(n);
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_alloc_port` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_alloc_port(old, port):
+    cond = z3.And(
+        old.io[port].owner == 0,
+        old.procs[old.current].use_io_bitmap,
+    )
+
+    new = old.copy()
+
+    new.io[port].owner = old.current
+    new.procs[old.current].nr_ports[port] += 1
+
+    page = util.If(z3.ULT(port, 0x8000),
+            new.procs[new.current].io_bitmap_a,
+            new.procs[new.current].io_bitmap_b)
+
+    port = z3.ZeroExt(64 - port.size(), util.If(z3.ULT(port, 0x8000), port, port - 0x8000))
+
+    idx = z3.UDiv(port, 64)
+    mask = 1 << (port % 64)
+
+    new.pages[page].data[idx] = new.pages[page].data(idx) & ~mask
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 2:
+Given a system call `sys_protect_frame`. 
+
+[Functional Description]:
+The `sys_protect_frame` system call is designed to modify the permissions of a specific frame in a process's page table, ensuring that the memory access rights are correctly configured according to the caller's requirements. This operation is crucial in managing memory protection in virtual memory systems, where controlling access to memory frames is essential for maintaining system security and stability.
+The system call begins by validating the specified page is valid and of the page table type. It also validates the page belongs to the calling process. If these conditions are not met, the operation is terminated with an error to maintain memory integrity and security.
+Next, the system verifies the validity of the specified index within the page table. This check ensures that the index falls within acceptable limits, preventing out-of-bounds access that could lead to undefined behavior or security vulnerabilities.
+The system verifies the type and ownership of the memory frame to ensure it is valid and belongs to the current process before modifying its permissions. It ensures that the frame is of the expected type and belongs to the current process. Any mismatch results in the operation being rejected with an error, safeguarding against unauthorized access or modification.
+The system retrieves the page table entries and checks if the specified slot is valid and present. If the slot is empty, the operation is terminated with an error, as there is no existing mapping to modify.
+The system further verifies that the existing page table entry corresponds to the specified frame by checking if the physical frame number derived from the page table entry matches the frame's expected physical address. If the check is not satisfied, the operation is terminated with an error, ensuring that the operation is being performed on the correct frame, preventing accidental modification of unrelated memory regions.
+The system enforces strict validation of the new permissions to be applied to the frame. It checks that the requested permissions do not include any unsafe bits in page permissions by comparing it against the page table entry permission mask and ensures the permissions are valid. If any of these conditions are not satisfied, the operation is terminated with an error, maintaining the security and stability of the memory system.
+Finally, the system updates the page table by configuring a page table entry to establish a mapping between a virtual memory address and a physical frame, while specifying the associated access permissions. This update is performed atomically to ensure consistency during the operation. After the modification, the system triggers a mechanism to invalidate Translation Lookaside Buffer entries associated with the virtual address space of the current process. This ensures that any stale or outdated address translations cached in the TLB are removed, forcing the processor to fetch updated mappings from the page tables and immediately reflect the new memory configuration.
+By the end of the operation, the specified frame has its permissions updated according to the caller's request. This allows the process to control access to its memory frames, enabling features such as read-only or execute-only protection. The `sys_protect_frame` system call, therefore, is a critical component of memory management, allowing processes to dynamically adjust memory protection as needed. Its design ensures that memory is safely managed, preventing unauthorized access and maintaining the integrity of the system's memory architecture.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_protect_frame(pn_t pt, size_t index, pn_t frame, pte_t perm)
+{
+    pte_t *entries;
+    pn_t pfn;
+
+    if (!is_page_type(pt, PAGE_TYPE_X86_PT))
+        return -EINVAL;
+    if (!is_page_pid(pt, current))
+        return -EACCES;
+    if (is_page_index_valid(index))
+        return -EINVAL;
+    if (!is_page_type(frame, PAGE_TYPE_FRAME))
+        return -EINVAL;
+    if (!is_page_pid(frame, current))
+        return -EACCES;
+
+    entries = get_page(pt);
+    /* check if the slot is empty */
+    if (!pte_valid(entries[index]))
+        return -EINVAL;
+    /* check if the entry matches */
+    pfn = PTE_ADDR(entries[index]) >> PAGE_SHIFT;
+    if (pn_to_pfn(frame) != pfn)
+        return -EINVAL;
+
+    /* check for unsafe bits in page permissions */
+    if (perm & ~PTE_PERM_MASK)
+        return -EINVAL;
+    /* make sure we have non-zero entries */
+    if (!pte_valid(perm))
+        return -EINVAL;
+
+    /* update the page table */
+    entries[index] = (pfn << PTE_PFN_SHIFT) | perm;
+    hvm_invalidate_tlb(current);
+
+    return 0;
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc page_desc_table[NPAGE] __aligned(PAGE_SIZE);
+
+extern struct proc proc_table[NPROC];
+
+#define PTE_ADDR(pte) ((physaddr_t)(pte)&BITMASK64(51, 12))
+#define PAGE_SHIFT 12
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), "page number must be valid");
+    return &page_desc_table[pn];
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_page_pid(pn_t pn, pid_t pid)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->pid == pid;
+}
+
+static inline bool is_page_index_valid(size_t index)
+{
+    return index < 512;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+static inline bool pte_valid(uintptr_t x)
+{
+    return x & PTE_P;
+}
+
+static inline pn_t pn_to_pfn(pn_t pn)
+{
+    pn_t pfn0 = (uintptr_t)pages / PAGE_SIZE;
+
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pfn0 + pn;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_protect_frame` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_protect_frame(old, pt, index, frame, perm):
+    cond = z3.And(
+        z3.ULT(pt, dt.NPAGE),
+        old.pages[pt].type == dt.page_type.PAGE_TYPE_X86_PT,
+        old.pages[pt].owner == old.current,
+
+        # Index is a valid page index
+        z3.ULT(index, 512),
+
+        z3.ULT(frame, dt.NPAGE),
+        old.pages[frame].type == dt.page_type.PAGE_TYPE_FRAME,
+        old.pages[frame].owner == old.current,
+
+        # index must be preset
+        old.pages[pt].data(index) & dt.PTE_P != 0,
+
+        # the entry in the pt must be the frame
+        z3.Extract(63, 40, z3.UDiv(old.pages_ptr_to_int,
+                                   z3.BitVecVal(dt.PAGE_SIZE, 64)) + frame) == z3.BitVecVal(0, 24),
+        z3.Extract(39, 0, z3.UDiv(old.pages_ptr_to_int, z3.BitVecVal(dt.PAGE_SIZE, 64)) + frame) == z3.Extract(51, 12, old.pages[pt].data(index)),
+
+        # no unsafe bits in perm is set
+        perm & (dt.MAX_INT64 ^ dt.PTE_PERM_MASK) == 0,
+
+        # P bit is set in perm
+        perm & dt.PTE_P != 0
+    )
+
+    new = old.copy()
+
+    new.pages[pt].data[index] = (
+        (z3.UDiv(new.pages_ptr_to_int, z3.BitVecVal(dt.PAGE_SIZE, 64)) + frame) << dt.PTE_PFN_SHIFT) | perm
+
+    # The only thing that changed is the permission.
+    new.pages[pt].pgtable_perm[index] = perm
+
+    new.flush_tlb(old.current)
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 3:
+Given a system call `sys_map_page_desc`. 
+
+[Functional Description]:
+The `sys_map_page_desc` system call is designed to map a portion of the page descriptor table into a process's address space. This operation is crucial for processes that need to access or manage page descriptors directly, such as in advanced memory management tasks or when implementing custom paging mechanisms. By allowing a process to map page descriptors, the system call provides flexibility in how memory is managed and accessed within the operating system.
+The system call begins by validating the number of pages requested to ensure it does not exceed the maximum allowable number of pages required for managing page descriptors. If the request number is too large, the system call returns an error, as it would attempt to map beyond the available descriptors. This check ensures that the mapping operation remains within the bounds of the page descriptor table, preventing access to invalid memory regions.
+Once the number is verified, the system calculates the physical frame number corresponding to the starting point of the page descriptor table in memory based on the number of pages requested. This calculation determines the specific memory region within the page descriptor table that will be mapped. Before proceeding with the mapping, the system call checks the specified permissions. If the permissions include write access, the operation is rejected. This restriction is crucial for maintaining the integrity of the page descriptor table, as allowing write access could lead to corruption or unauthorized modifications.
+The system then establishes the mapping by updating the appropriate entry in the process's page table to reference the page descriptors. It then performs a series of checks to ensure system consistency and security. The system first verifies the identity of the target process to ensure it is valid and active. If not satisfied, the system terminates the operation and signals an error. It also confirms that the process is either the current one or its embryo process. If not satisfied, the system terminates the operation and signals an error.
+The next step is to validate the validity, type and ownership of the memory region involved in the operation. The system ensures that the source page is a valid page, which corresponds to the expected type and is owned by the process. Additionally, it validates the specified location in the page to ensure it falls within acceptable range of page table entries. Any mismatch in type, ownership, or boundaries results in the function rejecting the operation with an error, ensuring memory integrity.
+The system also enforces strict validation of the permissions associated with the mapping. It checks that the requested permissions do not include any unsafe bits by comparing them against the permission mask and ensures the page table entry is valid. If any of these checks fail, the system terminates the operation and signals an error. This guarantees that the resulting mapping adheres to the system's security and functionality requirements.
+The system then retrieves the source page from the source page number, and verifies the specified entry within the page is unoccupied and empty. This ensures that existing mappings are not unintentionally overwritten, maintaining the integrity of existing memory configurations. If the location is already in use, the system terminates the operation and signals an error.
+Finally, the system updates the page table to reference the specified physical memory using the specified page table entry, while applying the validated permissions. The update is performed atomically to ensure consistency during the operation. After the mapping is established, the system triggers a mechanism to invalidate Translation Lookaside Buffer entries associated with the virtual address space of the current process. This step ensures that any outdated or stale cached translations are removed, allowing the system to immediately reflect the new memory configuration.
+The result of this operation is a mapped region in the process's address space that corresponds to a portion of the page descriptor table. This capability allows the process to access and manage page descriptors directly, enabling advanced memory management techniques and custom paging implementations. By integrating this functionality into the virtual memory system, the `sys_map_page_desc` system call enhances the flexibility and efficiency of memory management in the operating system.
+In conclusion, the `sys_map_page_desc` system call provides a mechanism for mapping page descriptors into a process's address space. It carefully validates inputs, enforces strict permissions, and ensures that the mapping is established securely and efficiently. This design allows processes to access and manage page descriptors directly, which is particularly useful in advanced memory management scenarios. By providing this capability, the system call contributes to the overall robustness and flexibility of the system's virtual memory architecture.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_map_page_desc(pid_t pid, pn_t from, size_t index, size_t n, pte_t perm)
+{
+    pn_t pfn;
+
+    if (n < bytes_to_pages(NPAGE * sizeof(struct page_desc)))
+        return -EINVAL;
+    pfn = (uintptr_t)page_desc_table / PAGE_SIZE + n;
+    if (pte_writable(perm))
+        return -EACCES;
+    return map_page(pid, from, index, pfn, perm, PAGE_TYPE_X86_PT);
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+#define roundup(x, y)                                                                              \
+    ({                                                                                             \
+        uintmax_t _x = (uintmax_t)(x);                                                             \
+        const typeof(y) _y = y;                                                                    \
+        (typeof(x))((((_x) + (_y - 1)) / _y) * _y);                                                \
+    })
+
+static inline size_t bytes_to_pages(size_t n)
+{
+    return roundup(n, PAGE_SIZE) / PAGE_SIZE;
+}
+
+static inline bool pte_writable(uintptr_t x)
+{
+    return x & PTE_W;
+}
+
+int map_page(pid_t pid, pn_t from_pn, size_t index, pn_t pfn, pte_t perm,
+             enum page_type from_type)
+{
+    pte_t *entries;
+
+    if (!is_pid_valid(pid))
+        return -ESRCH;
+    /* check if pid is current or its embryo */
+    if (!is_current_or_embryo(pid))
+        return -EACCES;
+    if (!is_page_type(from_pn, from_type))
+        return -EINVAL;
+    /* check if pid owns from_pfn */
+    if (!is_page_pid(from_pn, pid))
+        return -EACCES;
+    if (!is_page_index_valid(index))
+        return -EINVAL;
+    /* no check on pfn; left to caller */
+    /* check for unsafe bits in page permissions */
+    if (perm & ~PTE_PERM_MASK)
+        return -EINVAL;
+    /* make sure we have non-zero entries */
+    if (!pte_valid(perm))
+        return -EINVAL;
+
+    entries = get_page(from_pn);
+    /* make sure the entry is empty; may not be necessary but good to check */
+    if (pte_valid(entries[index]))
+        return -EINVAL;
+
+    /* update the page table */
+    mmio_write64(&entries[index], (pfn << PTE_PFN_SHIFT) | perm);
+    hvm_invalidate_tlb(pid);
+    return 0;
+}
+
+static inline bool is_pid_valid(pid_t pid)
+{
+    return pid > 0 && pid < NPROC;
+}
+
+/* permission check: we allow a pid to modify itself or its embryo */
+static inline bool is_current_or_embryo(pid_t pid)
+{
+    struct proc *proc;
+
+    if (pid == current)
+        return true;
+    proc = get_proc(pid);
+    if (proc->ppid == current && proc->state == PROC_EMBRYO)
+        return true;
+    return false;
+}
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), "page number must be valid");
+    return &page_desc_table[pn];
+}
+
+static inline bool is_page_pid(pn_t pn, pid_t pid)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->pid == pid;
+}
+
+static inline bool is_page_index_valid(size_t index)
+{
+    return index < 512;
+}
+
+static inline bool pte_valid(uintptr_t x)
+{
+    return x & PTE_P;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+static inline void mmio_write64(void *addr, uint64_t val)
+{
+    volatile uint64_t *p = addr;
+
+    *p = val;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_map_page_desc` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_map_page_desc(old, pid, frm, index, n, perm):
+    cond = z3.And(
+        z3.ULT(n, dt.NPAGES_PAGE_DESC_TABLE),
+
+        z3.And(pid > 0, pid < dt.NPROC),
+
+        # the pid is either current or an embryo belonging to current
+        z3.Or(pid == old.current,
+              z3.And(
+                  old.procs[pid].ppid == old.current,
+                  old.procs[pid].state == dt.proc_state.PROC_EMBRYO)),
+
+        # frm is a valid pn of type PT whose owner is pid
+        z3.ULT(frm, dt.NPAGE),
+        old.pages[frm].type == dt.page_type.PAGE_TYPE_X86_PT,
+        old.pages[frm].owner == pid,
+
+        # Index is a valid page index
+        z3.ULT(index, 512),
+
+        # perm has no unsafe bits on it and it is present and non-writable
+        perm & (dt.MAX_INT64 ^ dt.PTE_PERM_MASK) == 0,
+        perm & dt.PTE_P != 0,
+        perm & dt.PTE_W == 0,
+
+        # index does not have the P bit in the from page
+        old.pages[frm].data(index) & dt.PTE_P == 0,
+    )
+
+    new = old.copy()
+
+    new.pages[frm].data[index] = ((z3.UDiv(
+        new.page_desc_table_ptr_to_int, z3.BitVecVal(dt.PAGE_SIZE, 64)) + n) << dt.PTE_PFN_SHIFT) | perm
+
+    # maintain the "shadow" pgtable
+    new.pages[frm].pgtable_pn[index] = n
+    new.pages[frm].pgtable_perm[index] = perm
+    new.pages[frm].pgtable_type[index] = dt.PGTYPE_PAGE_DESC
+
+    new.flush_tlb(pid)
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 4:
+Given a system call `clone_proc`. 
+
+[Functional Description]:
+The `clone_proc` system call facilitates the creation of a new process by duplicating key aspects of an existing process, such as its memory layout, execution state, and kernel stack. This functionality is fundamental to multitasking operating systems, allowing new processes to be created either as independent entities or as lightweight threads that share certain resources with their parent. The clone_proc function, which implements this system call, ensures that the new process is correctly initialized and inherits the necessary context to execute seamlessly.
+The system call begins by allocating resources for the new process. It first validates the validity and the state of the specified process. If the process if invalid or not unused, the operation is rejected with an error. It then ensures that the necessary memory pages for the process's page table root, stack, and hardware state are valid and unallocated. If any of these resources are not valid,unavailable, or already in use, the operation is terminated with an error, preventing resource conflicts and ensuring system stability. Also, the system validates the process's page table root, stack, and hardware state are unique to each other. If any two of them are identical, the operation is rejected with an error.
+Once the validations are complete, the system initializes the new process's descriptor, setting its parent process identifier and marking it as in the embryonic state. This state indicates that the process is in the initial stages of creation and not yet fully operational. The system also allocates and initializes pages for the page table root, stack and hvm with the corresponding page type and then updates the current process's metadata to reflect the increase of pages allocated for the specified process. The metadata of the process's parent process is also updated to reflect the increase of its child processes.
+The system then duplicates the current process's execution context. It copies all the data of the kernel stack, which contains saved registers and execution state, to the new process's stack. This ensures that the new process begins execution with the same context as the parent process, allowing it to continue from the same point in the program.
+Next, the system copies the hardware virtual machine (HVM) state from the current process to the new process. This involves flushing the stale mappings to ensure consistency and copy data from the parent HVM to the child HVM state specified. This step is crucial for maintaining the execution environment, as it includes processor state and other critical hardware configurations.
+After duplicating the execution context, the system prepares the new process for execution.
+Finally, the system returns control to the user space, allowing the new process to begin execution. The new process starts with the same execution context as the parent, enabling it to perform tasks independently while sharing the same initial state.
+In summary, the `clone_proc` system call is a vital mechanism for process creation in operating systems. It carefully allocates resources, duplicates execution context, and prepares the new process for execution, ensuring a seamless and efficient process creation experience. By providing this functionality, the system call supports multitasking and process management, contributing to the overall robustness and flexibility of the operating system.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int clone_proc(pid_t pid, pn_t pml4, pn_t stack, pn_t hvm)
+{
+    int r;
+    struct proc *proc;
+    void *parent_hvm, *child_hvm;
+
+    r = alloc_proc(pid, pml4, stack, hvm);
+    if (r)
+        return r;
+
+    proc = get_proc(current);
+
+    /* copy the kernel stack (saved registers) */
+    memcpy(get_page(stack), get_page(proc->stack), PAGE_SIZE);
+
+    parent_hvm = get_page(proc->hvm);
+    child_hvm = get_page(hvm);
+    /* copy hvm state */
+    flush_current();
+    hvm_flush(child_hvm);
+    memcpy(child_hvm, parent_hvm, PAGE_SIZE);
+    hvm_copy(child_hvm, parent_hvm, pid);
+
+    /* will call run_current() upon return */
+    return 0;
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc page_desc_table[NPAGE] __aligned(PAGE_SIZE);
+
+extern struct proc proc_table[NPROC];
+
+#define NPAGE 8192  /* maximum number of pages */
+#define NPROC 64    /* maximum number of processes */
+#define PAGE_SHIFT 12
+#define PAGE_SIZE (UINT64_C(1) << PAGE_SHIFT)
+
+int alloc_proc(pid_t pid, pn_t page_table_root, pn_t stack, pn_t hvm)
+{
+    struct proc *proc, *parent;
+
+    if (!is_proc_state(pid, PROC_UNUSED))
+        return -ENOMEM;
+    if (!is_page_type(page_table_root, PAGE_TYPE_FREE))
+        return -ENOMEM;
+    if (is_page_type(stack, PAGE_TYPE_FREE))
+        return -ENOMEM;
+    if (is_page_type(hvm, PAGE_TYPE_FREE))
+        return -ENOMEM;
+    if (page_table_root == stack)
+        return -EINVAL;
+    if (page_table_root == hvm)
+        return -EINVAL;
+    if (stack == hvm)
+        return -EINVAL;
+
+    proc = get_proc(pid);
+    bzero(proc, sizeof(*proc));
+    proc->ppid = current;
+    proc->state = PROC_EMBRYO;
+
+    proc->page_table_root = page_table_root;
+
+    alloc_page(pid, PAGE_TYPE_PROC_DATA, stack);
+    proc->stack = stack;
+
+    alloc_page(pid, PAGE_TYPE_PROC_DATA, hvm);
+    proc->hvm = hvm;
+
+    parent = get_proc(current);
+    ++parent->nr_children;
+
+    return 0;
+}
+
+static inline bool is_proc_state(pid_t pid, enum proc_state state)
+{
+    return is_pid_valid(pid) && get_proc(pid)->state == state;
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), "page number must be valid");
+    return &page_desc_table[pn];
+}
+
+static inline bool is_pid_valid(pid_t pid)
+{
+    return pid > 0 && pid < NPROC;
+}
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+void bzero(void *s, size_t n)
+{
+    memset(s, 0, n);
+}
+
+#define FREELIST_DEL(arr, member, i)                \
+({                                                  \
+    typeof(&arr->member) entry = &arr[i].member;    \
+    arr[entry->next].member.prev = entry->prev;     \
+    arr[entry->prev].member.next = entry->next;     \
+    entry->next = entry->prev = 0;                  \
+})
+
+void alloc_page(pid_t pid, enum page_type type, pn_t pn)
+{
+    struct page_desc *desc = get_page_desc(pn);
+
+    assert(is_page_type(pn, PAGE_TYPE_FREE), "must be a free page");
+    desc->pid = pid;
+    desc->type = type;
+
+    if (pn != 0)
+        FREELIST_DEL(page_desc_table, link, pn);
+
+    bzero(get_page(pn), PAGE_SIZE);
+    if (pid)
+        ++get_proc(pid)->nr_pages;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+/* called in entry.S */
+void flush_current(void)
+{
+    struct proc *proc;
+    void *hvm;
+
+    proc = get_proc(current);
+    hvm = get_page(proc->hvm);
+    hvm_flush(hvm);
+    proc->launched = 0;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `clone_proc` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def clone_proc(old, pid, pml4, stack, hvm):
+    cond = z3.And(
+        z3.And(pid > 0, pid < dt.NPROC),
+        old.procs[pid].state == dt.proc_state.PROC_UNUSED,
+
+        z3.ULT(pml4, dt.NPAGE),
+        old.pages[pml4].type == dt.page_type.PAGE_TYPE_FREE,
+
+        z3.ULT(stack, dt.NPAGE),
+        old.pages[stack].type == dt.page_type.PAGE_TYPE_FREE,
+
+        z3.ULT(hvm, dt.NPAGE),
+        old.pages[hvm].type == dt.page_type.PAGE_TYPE_FREE,
+
+        z3.Distinct(pml4, stack, hvm),
+    )
+    new = old.copy()
+
+    # Initialize the proc
+    new.procs[pid].ppid = new.current
+    new.procs[pid].state = dt.proc_state.PROC_EMBRYO
+    new.procs[pid].killed = z3.BoolVal(False)
+    new.procs[pid].ipc_from = z3.BitVecVal(0, dt.pid_t)
+    new.procs[pid].ipc_val = z3.BitVecVal(0, dt.uint64_t)
+    new.procs[pid].ipc_page = z3.BitVecVal(0, dt.pn_t)
+    new.procs[pid].ipc_size = z3.BitVecVal(0, dt.size_t)
+    new.procs[pid].ipc_fd = z3.BitVecVal(0, dt.fd_t)
+    new.procs[pid].use_io_bitmap = z3.BoolVal(False)
+    new.procs[pid].io_bitmap_a = z3.BitVecVal(0, dt.pn_t)
+    new.procs[pid].io_bitmap_b = z3.BitVecVal(0, dt.pn_t)
+
+    # all refcnts should be zero at this point (according to invariants):
+    # no need to zero them
+    # new.proc_nr_pages = 0
+    # new.proc_nr_children = 0
+    # new.procs.nr_fds = 0
+    # new.proc_nr_devs = 0
+
+    new.procs[pid].ofile = z3.BitVecVal(0, dt.fn_t)
+    new.procs[pid].intr = z3.BitVecVal(0, 64)
+
+    # Maintain the "shadow" pgtable
+    new.pages[pml4].pgtable_pn = z3.BitVecVal(0, 64)
+    new.pages[pml4].pgtable_perm = z3.BitVecVal(0, 64)
+    new.pages[pml4].pgtable_type = dt.PGTYPE_NONE
+
+    # Claim the root pml4, the stack and hvm pages
+    # We need to do four things to claim a page.
+    # 1) Change the type from free to something else
+    # 2) change the owner
+    # 3) zero the page contents
+    # 4) bump the refcount for the owner
+    new.pages[pml4].type = dt.page_type.PAGE_TYPE_X86_PML4
+    new.pages[pml4].owner = pid
+    new.pages[pml4].data = z3.BitVecVal(0, 64)
+    new.procs[pid].nr_pages[pml4] += 1
+
+    new.pages[stack].type = dt.page_type.PAGE_TYPE_PROC_DATA
+    new.pages[stack].owner = pid
+    new.pages[stack].data = z3.BitVecVal(0, 64)
+    new.procs[pid].nr_pages[stack] += 1
+
+    new.pages[hvm].type = dt.page_type.PAGE_TYPE_PROC_DATA
+    new.pages[hvm].owner = pid
+    new.pages[hvm].data = z3.BitVecVal(0, 64)
+    new.procs[pid].nr_pages[hvm] += 1
+
+    new.procs[pid].page_table_root = pml4
+    new.procs[pid].stack = stack
+    new.procs[pid].hvm = hvm
+
+    new.procs[new.current].nr_children[pid] += 1
+
+    # Copy parent's hvm to child's hvm
+    new.pages.data = lambda pn, idx, oldfn: \
+        util.If(pn == hvm,
+                oldfn(new.procs[new.current].hvm, idx),
+                oldfn(pn, idx))
+
+    # Copy parent's stack to child's stack
+    new.pages.data = lambda pn, idx, oldfn: \
+        util.If(pn == stack,
+                oldfn(new.procs[new.current].stack, idx),
+                oldfn(pn, idx))
+
+    return cond, util.If(cond, new, old)
+```
+
+Example 5:
+Given a system call `sys_dup2`. 
+
+[Functional Description]:
+The `sys_dup2` system call provides a mechanism for duplicating a file descriptor from one process to another or within the same process. This operation is essential for managing file descriptor tables, allowing processes to redirect input/output streams or share file descriptors between processes. By duplicating a file descriptor, a process can create an alias for an existing file descriptor, enabling flexible file management and inter-process communication.
+The system call begins by validating the specified process identifier to ensure it corresponds to a valid and active process. If the process identifier is invalid, the operation is terminated with an error, as the duplication cannot proceed without a valid target. The system also checks that the process is either the current one or its embryo process, ensuring that the operation is authorized.
+Next, the system verifies the validity of the source file descriptor within the current process. It also validates the source file descriptor exists in the calling process. If the source file descriptor is invalid or does not exist in the calling process, the operation is rejected with an error. This check ensures that the duplication operation is based on a valid file descriptor, preventing errors or undefined behavior.
+The system then checks the validity of the target file descriptor. If the target file descriptor is invalid, the operation is terminated with an error. This validation ensures that the target location for the duplication is within acceptable limits, maintaining the integrity of the file descriptor table.
+If the source and target file descriptors are the same and belong to the same process, the system call does nothing and returns successfully. This behavior aligns with the POSIX standard, which specifies that duplicating a file descriptor to itself should have no effect.
+If the target file descriptor already exists in the target process, the system closes it before proceeding with the duplication.    Closing the file involves updating the process's file descriptor table to mark the descriptor as unused and decrementing the count of open file descriptors for the process. Additionally, the system updates the file's reference count to reflect the decrease of the file references. And if the file is no longer referenced by any process, it resets the file's attributes, including its type, value, offset, and mode of operation, releasing the associated resources. This step guarantees that newfd is free and available for duplication.
+Finally, the system proceeds to duplicate the source file descriptor. The system associates the file descriptor with the file or resource by updating the target process's file descriptor table. The reference count of the file or resource is incremented to reflect its usage, and the number of file descriptors in use by the process is also updated to show the increase of the associated file descriptors. Furthermore, the system updates the metadata of the process and the file to reflect the open status of the file in a new process. This assignment is performed atomically to ensure consistency and correctness during the operation.
+In conclusion, the `sys_dup2` system call is a crucial feature for managing file descriptors in a flexible and efficient manner. It carefully validates inputs, enforces strict permissions, and ensures that the duplication is performed securely and accurately. This design allows processes to manage their file descriptors effectively, contributing to the overall robustness and flexibility of the system's file management architecture.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_dup2(int oldfd, pid_t pid, int newfd)
+{
+    fn_t fn;
+
+    if (!is_pid_valid(pid))
+        return -ESRCH;
+    if (!is_current_or_embryo(pid))
+        return -EACCES;
+    /* oldfd doesn't exist  */
+    if (!is_fd_valid(oldfd))
+        return -EBADF;
+    fn = get_fd(current, oldfd);
+    if (fn == 0)
+        return -EBADF;
+    if (!is_fd_valid(newfd))
+        return -EBADF;
+
+    /* POSIX: do nothing for the same fd */
+    if ((current == pid) && (oldfd == newfd))
+        return 0;
+
+    /* close newfd if it already exists */
+    if (get_fd(pid, newfd) == 0)
+        clear_fd(pid, newfd);
+    set_fd(pid, newfd, fn);
+    return 0;
+}
+
+enum file_type {
+    FD_NONE = 0,
+    FD_PIPE,
+    FD_INODE,
+    FD_SOCKET,
+
+    FD_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct file {
+    enum file_type type;
+    size_t refcnt;
+    uint64_t value;
+    uint64_t omode;
+    size_t offset;
+};
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+extern struct proc proc_table[NPROC];
+
+#define NPAGE 8192  /* maximum number of pages */
+#define NPROC 64    /* maximum number of processes */
+#define NOFILE 16   /* open files per process */
+#define NFILE 128   /* open files per system */
+
+static inline bool is_pid_valid(pid_t pid)
+{
+    return pid > 0 && pid < NPROC;
+}
+
+/* permission check: we allow a pid to modify itself or its embryo */
+static inline bool is_current_or_embryo(pid_t pid)
+{
+    struct proc *proc;
+
+    if (pid == current)
+        return true;
+    proc = get_proc(pid);
+    if (proc->ppid == current && proc->state == PROC_EMBRYO)
+        return true;
+    return false;
+}
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+static inline bool is_fd_valid(int fd)
+{
+    return fd >= 0 && fd < NOFILE;
+}
+
+static inline fn_t get_fd(pid_t pid, int fd)
+{
+    assert(is_fd_valid(fd), "fd must be valid");
+    return get_proc(pid)->ofile[fd];
+}
+
+static inline void clear_fd(pid_t pid, int fd)
+{
+    struct proc *proc;
+    struct file *file;
+
+    proc = get_proc(pid);
+    file = get_file(get_fd(pid, fd));
+    proc->ofile[fd] = 0;
+    --proc->nr_fds;
+    if (--file->refcnt == 0) {
+        file->type = FD_NONE;
+        file->value = 0;
+        file->offset = 0;
+        file->omode = 0;
+    }
+}
+
+extern struct file file_table[NFILE];
+
+static inline struct file *get_file(fn_t fn)
+{
+    assert(is_fn_valid(fn), "fn must be valid");
+    return &file_table[fn];
+}
+
+static inline bool is_fn_valid(fn_t fn)
+{
+    return fn > 0 && fn < NFILE;
+}
+
+static inline void set_fd(pid_t pid, int fd, fn_t fn)
+{
+    struct proc *proc;
+    struct file *file;
+
+    assert(get_fd(pid, fd) == 0, "fd must be valid");
+    proc = get_proc(pid);
+    file = get_file(fn);
+    proc->ofile[fd] = fn;
+    ++proc->nr_fds;
+    ++file->refcnt;
+}
+
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_dup2` provided above, the state-machine specification of the system call is deduced as follows:
+```python
+def sys_dup2(old, oldfd, pid, newfd):
+    cond = z3.And(
+        z3.And(pid > 0, pid < dt.NPROC),
+
+        # the pid is either current or an embryo belonging to current
+        z3.Or(pid == old.current,
+              z3.And(
+                  old.procs[pid].ppid == old.current,
+                  old.procs[pid].state == dt.proc_state.PROC_EMBRYO)),
+
+        z3.And(oldfd >= 0, oldfd < dt.NOFILE),
+        z3.And(z3.UGT(old.procs[old.current].ofile(oldfd), 0), z3.ULT(old.procs[old.current].ofile(oldfd), dt.NFILE)),
+
+        z3.And(newfd >= 0, newfd < dt.NOFILE),
+    )
+
+    new1 = old.copy()
+
+    newfn = new1.procs[pid].ofile(newfd)
+
+    # If fn != 0
+
+    new1.procs[pid].ofile[newfd] = z3.BitVecVal(0, dt.fn_t)
+
+    new1.procs[pid].nr_fds[newfd] -= 1
+
+    # decrement file refcnt
+    new1.files[newfn].refcnt[(pid, newfd)] -= 1
+
+    ref = new1.files[newfn].refcnt()
+
+    # If the refcnt is zero, clear the file slot
+
+    new1.files[newfn].type = util.If(ref == 0, dt.file_type.FD_NONE, new1.files[newfn].type)
+    new1.files[newfn].value = util.If(ref == 0, z3.BitVecVal(0, dt.uint64_t), new1.files[newfn].value)
+    new1.files[newfn].offset = util.If(ref == 0, z3.BitVecVal(0, dt.off_t), new1.files[newfn].offset)
+    new1.files[newfn].omode = util.If(ref == 0, z3.BitVecVal(0, dt.uint64_t), new1.files[newfn].omode)
+
+    new2 = util.If(z3.And(z3.UGT(old.procs[pid].ofile(newfd), 0), z3.ULT(old.procs[pid].ofile(newfd), dt.NFILE)), new1, old.copy())
+
+    # un-conditional
+
+    fn = new2.procs[old.current].ofile(oldfd)
+
+    new2.procs[pid].ofile[newfd] = fn
+
+    new2.procs[pid].nr_fds[newfd] += 1
+
+    # bump file refcnt
+    new2.files[fn].refcnt[(pid, newfd)] += 1
+
+    # posix: if fds are the same, do nothing
+
+    new3 = util.If(z3.And(old.current == pid, oldfd == newfd),
+                   old.copy(), new2)
+
+    return cond, util.If(cond, new3, old)
+```
+
+### Task Question:
+Now, given the system call `sys_map_dev`. 
+
+[Functional Description]:
+The `sys_map_dev` system call is designed to map a range of device memory into a process's address space, allowing the process to interact with hardware devices directly. This functionality is crucial in systems where processes need to access device registers or memory-mapped I/O regions, such as in device drivers or low-level system utilities.
+The operation begins by validating the number of pages requested to ensure it does not exceed the maximum allowable number of pages required for managing PCI devices. If the request number is too large, the operation is terminated with an error, as it cannot proceed with an invalid number.
+Once the number is verified, the system calculates the physical frame number corresponding to the starting point of the device table based on the number of pages requested. This calculation determines the specific memory region within the PCI device table that will be mapped.
+Before proceeding, the system checks the specified permissions for the mapping. If the permissions include write access, the operation is rejected with an error. This restriction ensures the integrity of the device memory, as allowing write permissions could lead to accidental or malicious corruption of the device's state. By enforcing read-only or execute-only permissions, the system maintains the stability and security of the device interaction.
+The system then establishes the mapping by updating the appropriate entry in the process's page table to reference the device. It operates by performing a series of checks, updating the page table, and ensuring system consistency. The system first verifies the identity of the target process to ensure it is valid and active. If not satisfied, the system terminates the operation and signals an error. It also confirms that the process is either the current one or its embryo process.
+The next step is to validate the validity, type and ownership of the memory region involved in the operation. The system ensures that the source page is a valid page, which corresponds to the expected type and is owned by the process. Additionally, it validates the specified location in the page to ensure it falls within acceptable range of page table entries. Any mismatch in type, ownership, or boundaries results in the function rejecting the operation with an error, ensuring memory integrity.
+The system also enforces strict validation of the new permissions to be applied to the page. It checks that the requested permissions do not include any unsafe bits in page permissions by comparing it against the page table entry permission mask and ensures the permissions are valid. If any of them is not satisfied, the system terminates the operation and signals an error. This guarantees that the resulting mapping adheres to the system's security and functionality requirements.
+The system then retrieves the source page from the page number and verifies that the specified entry is unoccupied and empty. This ensures that existing mappings are not unintentionally overwritten, maintaining the integrity of existing memory configurations. If the location is already in use, the system terminates the operation and signals an error.
+The system then updates the page table to reference the specified physical memory using the specified page table entry, while applying the validated permissions. The update is performed atomically to ensure consistency during the operation. After the mapping is established, the system triggers a mechanism to invalidate Translation Lookaside Buffer entries associated with the virtual address space of the current process. This step ensures that any outdated or stale cached translations are removed, allowing the system to immediately reflect the new memory configuration.
+In conclusion, the `sys_map_dev` system call provides a secure and efficient mechanism for mapping device memory into a process's address space through memory-mapped I/O. It carefully validates inputs, enforces strict permissions, and ensures that the mapping is established securely and efficiently. This design allows processes to access and manage device memory directly, which is particularly useful in advanced device management scenarios. By providing this capability, the system call contributes to the overall robustness and flexibility of the system's device management architecture.
+
+[Code Implementation]:
+Its corresponding code implementation that may contain bugs is as follows: 
+```c
+int sys_map_dev(pid_t pid, pn_t from, size_t index, size_t n, pte_t perm)
+{
+    pn_t pfn;
+
+    if (n >= bytes_to_pages(NPCIDEV * sizeof(struct pci_dev)))
+        return -EINVAL;
+    pfn = (uintptr_t)devices / PAGE_SIZE + n;
+    if (pte_writable(perm))
+        return -EACCES;
+    return map_page(pid, from, index, pfn, perm, PAGE_TYPE_X86_PT);
+}
+
+enum page_type {
+    PAGE_TYPE_FREE = 0,
+    PAGE_TYPE_RESERVED,
+    PAGE_TYPE_PROC_DATA,
+    PAGE_TYPE_FRAME,
+    PAGE_TYPE_X86_PML4,
+    PAGE_TYPE_X86_PDPT,
+    PAGE_TYPE_X86_PD,
+    PAGE_TYPE_X86_PT,
+    PAGE_TYPE_IOMMU_PML4,
+    PAGE_TYPE_IOMMU_PDPT,
+    PAGE_TYPE_IOMMU_PD,
+    PAGE_TYPE_IOMMU_PT,
+    PAGE_TYPE_IOMMU_FRAME,
+
+    /* hack to force 64bit */
+    PAGE_TYPE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+struct proc {
+    enum proc_state state : 64; /* process state  */
+    pid_t ppid;
+    pn_t page_table_root; /* page table root */
+    pn_t stack;           /* kernel stack */
+    pn_t hvm;
+    pn_t io_bitmap_a;
+    pn_t io_bitmap_b;
+    fn_t ofile[NOFILE]; /* open files */
+    size_t nr_children;
+    size_t nr_fds;
+    size_t nr_pages;
+    size_t nr_dmapages;
+    size_t nr_devs;
+    size_t nr_ports;
+    size_t nr_vectors;
+    size_t nr_intremaps;
+    int launched;
+    int killed;
+    int use_io_bitmap;
+    pid_t ipc_from;
+    uint64_t ipc_val;
+    pn_t ipc_page;
+    size_t ipc_size;
+    int ipc_fd;
+    BITSET_DEFINE(intr, 256);
+    uint64_t name[2]; /* process name (debugging) */
+    struct {
+        pid_t prev;
+        pid_t next;
+    } ready;      /* ready queue for runnable/running processes */
+};
+
+struct page_desc {
+    enum page_type type : 64;
+    pid_t pid;
+    struct {
+        pn_t prev;
+        pn_t next;
+    } link;
+};
+
+enum proc_state {
+    PROC_UNUSED = 0,
+    PROC_EMBRYO,
+    PROC_RUNNABLE,
+    PROC_RUNNING,
+    PROC_SLEEPING,
+    PROC_ZOMBIE,
+
+    /* hack to force 64bit */
+    PROC_STATE_FORCE_WIDTH = 0xfffffffffffffffful,
+};
+
+#define roundup(x, y)                                                                              \
+    ({                                                                                             \
+        uintmax_t _x = (uintmax_t)(x);                                                             \
+        const typeof(y) _y = y;                                                                    \
+        (typeof(x))((((_x) + (_y - 1)) / _y) * _y);                                                \
+    })
+
+static inline size_t bytes_to_pages(size_t n)
+{
+    return roundup(n, PAGE_SIZE) / PAGE_SIZE;
+}
+
+static inline bool pte_writable(uintptr_t x)
+{
+    return x & PTE_W;
+}
+
+int map_page(pid_t pid, pn_t from_pn, size_t index, pn_t pfn, pte_t perm,
+             enum page_type from_type)
+{
+    pte_t *entries;
+
+    if (!is_pid_valid(pid))
+        return -ESRCH;
+    /* check if pid is current or its embryo */
+    if (!is_current_or_embryo(pid))
+        return -EACCES;
+    if (!is_page_type(from_pn, from_type))
+        return -EINVAL;
+    /* check if pid owns from_pfn */
+    if (!is_page_pid(from_pn, pid))
+        return -EACCES;
+    if (!is_page_index_valid(index))
+        return -EINVAL;
+    /* no check on pfn; left to caller */
+    /* check for unsafe bits in page permissions */
+    if (perm & ~PTE_PERM_MASK)
+        return -EINVAL;
+    /* make sure we have non-zero entries */
+    if (!pte_valid(perm))
+        return -EINVAL;
+
+    entries = get_page(from_pn);
+    /* make sure the entry is empty; may not be necessary but good to check */
+    if (pte_valid(entries[index]))
+        return -EINVAL;
+
+    /* update the page table */
+    mmio_write64(&entries[index], (pfn << PTE_PFN_SHIFT) | perm);
+    hvm_invalidate_tlb(pid);
+    return 0;
+}
+
+static inline bool is_pid_valid(pid_t pid)
+{
+    return pid > 0 && pid < NPROC;
+}
+
+/* permission check: we allow a pid to modify itself or its embryo */
+static inline bool is_current_or_embryo(pid_t pid)
+{
+    struct proc *proc;
+
+    if (pid == current)
+        return true;
+    proc = get_proc(pid);
+    if (proc->ppid == current && proc->state == PROC_EMBRYO)
+        return true;
+    return false;
+}
+
+static struct proc *get_proc(pid_t pid)
+{
+    assert(is_pid_valid(pid), "pid must be valid");
+    return &proc_table[pid];
+}
+
+static inline bool is_page_type(pn_t pn, enum page_type type)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->type == type;
+}
+
+static inline bool is_pn_valid(pn_t pn)
+{
+    return pn < NPAGE;
+}
+
+static inline struct page_desc *get_page_desc(pn_t pn)
+{
+    assert(is_pn_valid(pn), "page number must be valid");
+    return &page_desc_table[pn];
+}
+
+static inline bool is_page_pid(pn_t pn, pid_t pid)
+{
+    return is_pn_valid(pn) && get_page_desc(pn)->pid == pid;
+}
+
+static inline bool is_page_index_valid(size_t index)
+{
+    return index < 512;
+}
+
+static inline bool pte_valid(uintptr_t x)
+{
+    return x & PTE_P;
+}
+
+static inline void *get_page(pn_t pn)
+{
+    assert(is_pn_valid(pn), "pn must be valid");
+    return pages + pn;
+}
+
+static inline void mmio_write64(void *addr, uint64_t val)
+{
+    volatile uint64_t *p = addr;
+
+    *p = val;
+}
+```
+
+[Specification]:
+Based on the detailed functional description and the potentially buggy code implementation of the system call `sys_map_dev` provided above, the state-machine specification of the system call is deduced as follows:

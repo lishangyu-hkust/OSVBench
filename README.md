@@ -7,14 +7,13 @@
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 ## Table of Contents
-- [OSVBench: Benchmarking LLMs on Specification Generation Tasks for Operating System Verification](#osvbench-benchmarking-llms-on-specification-generation-tasks-for-operating-system-verification)
-  - [Overview](#overview)
-  - [Environment Setup](#environment-setup)
-  - [Benchmark](#benchmark)
-  - [Prompt Template](#prompt-template)
-  - [Evaluation](#evaluation)
-  - [License](#license)
-  - [Citation](#citation)
+- [Overview](#overview)
+- [Environment Setup](#environment-setup)
+- [Benchmark](#benchmark)
+- [Prompt Template](#prompt-template)
+- [Evaluation](#evaluation)
+- [License](#license)
+- [Citation](#citation)
 
 ## Overview
 We introduce OSVBench, a new benchmark for evaluating Large Language Models (LLMs) in generating complete specification code pertaining to operating system kernel verification tasks. The benchmark first defines the specification generation problem into a program synthesis problem within a confined scope of syntax and semantics by providing LLMs with the programming model. The LLMs are required to understand the provided verification assumption and the potential syntax and semantics space to search for, then generate the complete specification for the potentially buggy operating system code implementation under the guidance of the high-level functional description of the operating system. This benchmark is built upon a real-world operating system kernel, Hyperkernel, and consists of 245 complex specification generation tasks in total, each is a long context task of about 20k-30k tokens. Our comprehensive evaluation of 12 LLMs exhibits the limited performance of the current LLMs on the specification generation tasks for operating system verification. Significant disparities of their performance on the benchmark,differentiating the ability on long context code generation tasks.
@@ -168,7 +167,7 @@ Files we created are licensed under the Apache License, Version 2.0, viewable at
 ## Citation
 > [!IMPORTANT]
 > 
-> If you use the data or code in this repo, please consider citing the following paper:
+> If you use the data or code in this repo, please consider citing the following papers:
 
 ```BibTex
 @misc{li2025osvbenchbenchmarkingllmsspecification,

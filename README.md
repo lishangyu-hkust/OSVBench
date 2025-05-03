@@ -72,18 +72,18 @@ Or:
 
 ```bash
 python LLM_API_Invocations_passk.py \
---llm {gpt4om} \
---task {Spec} \
---problem_num {245} \
---resume {true} \
---results {Spec} \
---sleep {5} \
---example {5_shots_examples} \
---data {benchmark.json} \
---restart {N1} \
---end {N2} \
---task_number {N3} \
---pass_n {1}
+    --llm {gpt4om} \
+    --task {Spec} \
+    --problem_num {245} \
+    --resume {true} \
+    --results {Spec} \
+    --sleep {5} \
+    --example {5_shots_examples} \
+    --data {benchmark.json} \
+    --restart {N1} \
+    --end {N2} \
+    --task_number {N3} \
+    --pass_n {1}
 ```
 
 **Key Parameters**:

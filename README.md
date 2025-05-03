@@ -20,9 +20,6 @@ We introduce OSVBench, a new benchmark for evaluating Large Language Models (LLM
 
 ![The workflow of OSVBench](assets/osvbench.png)
 
-- Authors: Shangyu Li, Juyong Jiang, Tiancheng Zhao, Jiasi Shen
-- Paper: [https://arxiv.org/abs/2504.20964](https://arxiv.org/abs/2504.20964)
-
 ## Environment Setup
 
 Python version: >= 3.8

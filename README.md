@@ -40,15 +40,15 @@ The data format is:
 
 ```json
 [
-{
-    "syscall": "syscall name",
-    "declaration": "syscall declaration",
-    "description": "\n[Functional Description]: ... ",
-    "code": "[Code Implementation]: ... ",
-    "bug_type": "bug type",
-    "bug_num": "bug number"
-},
-...
+    {
+        "syscall": "syscall name",
+        "declaration": "syscall declaration",
+        "description": "\n[Functional Description]: ... ",
+        "code": "[Code Implementation]: ... ",
+        "bug_type": "bug type",
+        "bug_num": "bug number"
+    },
+    ...
 ]
 ```
 

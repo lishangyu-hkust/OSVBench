@@ -7,6 +7,7 @@
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 ## Table of Contents
+- [Table of Contents](#table-of-contents)
 - [Overview](#overview)
 - [Environment Setup](#environment-setup)
 - [Benchmark](#benchmark)
@@ -105,12 +106,14 @@ Upon successful completion, the generated state-machine specifications will be s
 
 **2. Using the LLM generated state-machine specification to verify the functional correctness of Hyperkernel.**
 
+Replace `</path/to/>` with your path and then proceed as follows:
+
 ```bash
 bash ./run_spec_check.sh {specification file name}
 ```
 
 Example: To use the file `./results/Spec/claude3sonnet_Spec.json`, run the command:
-`bash ./run_spec_chech.sh claude3sonnet_Spec` (without `.json`)
+`bash ./run_spec_check.sh claude3sonnet_Spec` (without `.json`)
 
 Upon completion, the verification results will be stored in the `./outputs` directory (e.g., `./outputs/output_claude3sonnet_Spec`), encompassing the outcomes for all 245 tasks.
 
